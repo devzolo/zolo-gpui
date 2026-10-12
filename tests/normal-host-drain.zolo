@@ -1,0 +1,49 @@
+// Non-GUI application lifecycle regression. prepare-normal-host-drain.cjs
+// substitutes only the foreign host; this uses the actual library's lifecycle.
+use group_host::{application, install_host_action, fail_host_once, Text}
+
+fn exercise(mode: int) {
+    var main_cleaned = false
+    var child_started = false
+    var child_cleaned = false
+    var late = 0
+    let app = application("normal-host-return-{mode}")
+    let main = app.window("main", || Text("main"))
+    main.context().run(|| spawn {
+        defer { main_cleaned = true; print("HOST:MAIN:CLEANUP:{mode}") }
+        sleep(86400000)
+        late += 1
+    })
+    install_host_action(|| {
+        let child = app.window("child", || Text("child"))
+        let cx = child.context()
+        cx.run(|| spawn {
+            defer {
+                sleep(2)
+                assert(cx.window() == child, "cleanup must retain its original context")
+                child_cleaned = true
+                print("HOST:CHILD:CLEANUP:{mode}")
+                if mode >= 2 { error("cleanup failure", 0) }
+            }
+            child_started = true
+            sleep(86400000)
+            late += 1
+        })
+        return nil
+    })
+    if mode == 1 || mode == 2 { fail_host_once() }
+    var failed = false
+    var failure: Any = nil
+    try { app.run() } catch e { failed = true; failure = e }
+    print("HOST:RECEIPT:{mode}:main={main_cleaned}:child_started={child_started}:child={child_cleaned}:late={late}")
+    print("HOST:FAILURE:{mode}:failed={failed}:error={failure}")
+    assert(main_cleaned && child_started && child_cleaned && late == 0, "host return must drain dynamically created window tasks")
+    if mode == 0 { assert(!failed, "normal return must succeed after cleanup") }
+    else if mode == 3 { assert(failed && "{failure}".ends_with("cleanup failure"), "normal return must surface cleanup failure") }
+    else { assert(failed && failure == "original host failure", "cleanup must preserve the original host failure") }
+    assert(!main.is_open(), "main window must be retired")
+    print("HOST:DRAIN:PASS:{mode}")
+}
+
+// Normal return, host failure, combined failure, cleanup-only failure.
+for mode in 0..4 { exercise(mode) }

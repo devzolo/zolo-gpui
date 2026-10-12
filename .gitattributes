@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+*.zolo text eol=lf linguist-language=Rust
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf

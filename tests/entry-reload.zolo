@@ -1,0 +1,240 @@
+use group_host::{application, run, smoke, Window, WindowOptions, Node, Text, Button, Column, Component, install_reload_host, queue_entry, advance_once, render_now, click_now, start_tasks, window_id, dispose_test_app, install_legacy_host, legacy_render_now, legacy_advance_once}
+use std::async::{task_group}
+
+var clicks = 0
+var cleaned = false
+var late = 0
+var rejected: Window? = nil
+var retired_app_cleaned = false
+var retired_window: Window? = nil
+var retry_window: Window? = nil
+var retry_app: Any = nil
+var parked_cleaned = false
+var rejected_tools: Window? = nil
+var accepted_tools: Window? = nil
+var rejected_tools_context: Any = nil
+var tools_cleaned = false
+var module_text = "module-before"
+var component_text = "component-before"
+var component_renders = 0
+fn cached_module_child() -> Node {
+    component_renders += 1
+    return Text(component_text)
+}
+fn module_view() -> Node {
+    return Column(children: [Text(module_text), Component("stable-module-child", cached_module_child)])
+}
+let parked = application("preexisting")
+let parked_window = parked.window("parked", || Text("parked"))
+parked_window.context().run(|| spawn {
+    defer { parked_cleaned = true }
+    sleep(86400000)
+})
+start_tasks(parked_window)
+let independent = task_group()
+independent.run(|| spawn { sleep(86400000) })
+independent.poll()
+let app = application("__run")
+let main = app.window("main", || Button(on_click: || { clicks += 1 }, children: [Text("initial")]))
+let module_window = app.window("module-cache", module_view)
+install_reload_host(|| {
+    assert(render_now(main)[0].children[0].text == "initial")
+    // These event changes precede replay and must survive its failure.
+    main.title("event-title")
+    let event_window = app.window("event", || Text("event"), WindowOptions.new(title: "event-window"))
+    app.window("main", || Button(on_click: || { clicks += 2 }, children: [Text("event-before")]))
+    // A successful module replay in the same poll makes the aggregate bool true.
+    queue_entry(|| {
+        main.title("module-title")
+        app.window("module", || Text("module"), WindowOptions.new(title: "module-window"))
+        return nil
+    })
+    queue_entry(|| {
+        run(|| Button(on_click: || { clicks += 100 }, children: [Text("rejected")]))
+        main.title("rejected-title")
+        let unseen = app.window("rejected", || Text("rejected-window"))
+        rejected = unseen
+        let cx = unseen.context()
+        cx.run(|| spawn {
+            defer {
+                sleep(2)
+                assert(cx.window() == unseen, "rejected window must retain context while draining")
+                cleaned = true
+            }
+            sleep(86400000)
+            late += 1
+        })
+        start_tasks(unseen)
+        error("expected entry reload failure", 0)
+    })
+    let failed = advance_once()
+    assert(failed.windows.len() == 2 && failed.windows[0].title == "event-window" && failed.windows[1].title == "module-window", "only earlier admitted windows should publish")
+    assert(failed.commands.len() == 2 && failed.commands[0].text == "event-title" && failed.commands[1].text == "module-title", "only earlier admitted titles should publish")
+    assert(!rejected.is_open(), "failed replay window must not stay open")
+    assert(event_window.is_open(), "event-created window must survive failed replay")
+    assert(render_now(main)[0].children[0].text == "event-before", "failed entry must preserve earlier pending view")
+    click_now(main)
+    assert(clicks == 2, "valid event handlers must survive failed replay")
+    while !cleaned { advance_once(); sleep(1) }
+    assert(late == 0, "cancelled rejected task must suppress later body statements")
+    print("ENTRY:REJECTED:PASS")
+    print("ENTRY:MIXED_BATCH:PASS")
+    queue_entry(|| {
+        app.window("main", || Button(on_click: || { clicks += 3 }, children: [Text("accepted")]))
+        main.title("accepted-title")
+        app.window("accepted", || Text("accepted-window"), WindowOptions.new(title: "accepted-window"))
+        return nil
+    })
+    let accepted = advance_once()
+    assert(accepted.windows.len() == 1 && accepted.windows[0].title == "accepted-window")
+    assert(accepted.commands.len() == 1 && accepted.commands[0].text == "accepted-title")
+    assert(render_now(main)[0].children[0].text == "accepted")
+    click_now(main)
+    assert(clicks == 5, "successful entry must publish its new handler")
+    app.window("main", || Button(on_click: || { clicks += 4 }, children: [Text("idle-event")]))
+    let idle = advance_once()
+    assert(idle.windows.len() == 0 && idle.commands.len() == 0)
+    assert(render_now(main)[0].children[0].text == "idle-event", "idle poll must retain event replacement")
+    click_now(main)
+    assert(clicks == 9)
+    print("ENTRY:ACCEPTED:PASS")
+    print("ENTRY:IDLE:PASS")
+    queue_entry(|| {
+        app.window("main", || Button(on_click: || { clicks += 5 }, children: [Text("first-valid")]))
+        main.title("first-valid-title")
+        return nil
+    })
+    queue_entry(|| {
+        app.window("main", || Button(on_click: || { clicks += 100 }, children: [Text("second-rejected")]))
+        main.title("second-rejected-title")
+        error("later entry failed", 0)
+    })
+    let multiple = advance_once()
+    assert(multiple.commands.len() == 1 && multiple.commands[0].text == "first-valid-title", "failed later entry must preserve successful earlier entry")
+    assert(render_now(main)[0].children[0].text == "first-valid")
+    click_now(main)
+    assert(clicks == 14)
+    print("ENTRY:MULTIPLE_REPLAYS:PASS")
+    let before_module = render_now(module_window)
+    assert(before_module[0].children[0].text == "module-before")
+    assert(before_module[0].children[1].children[0].text == "component-before")
+    render_now(module_window)
+    assert(component_renders == 1, "unchanged keyed component must use its cache")
+    advance_once()
+    queue_entry(|| {
+        // A successful module changes code/data behind retained function references.
+        module_text = "module-after"
+        component_text = "component-after-ação"
+        return nil
+    })
+    queue_entry(|| {
+        run(|| Text("module-batch-rejected"))
+        error("entry tail failed beside a successful module", 0)
+    })
+    let module_turn = advance_once()
+    var module_changed = false
+    for poll in module_turn.polls { if poll.window == window_id(module_window) { module_changed = poll.changed } }
+    assert(module_changed, "successful module replay must invalidate the retained top-level view")
+    let after_module = render_now(module_window)
+    assert(after_module[0].children[0].text == "module-after")
+    assert(after_module[0].children[1].children[0].text == "component-after-ação", "module replay must invalidate keyed component caches")
+    assert(component_renders == 2, "accepted module replay must render its cached component once")
+    assert(render_now(main)[0].children[0].text == "first-valid", "module invalidation must not publish a failed entry candidate")
+    let idle_module = advance_once()
+    for poll in idle_module.polls { if poll.window == window_id(module_window) { assert(!poll.changed, "idle polls must not invalidate views") } }
+    print("ENTRY:MODULE_INVALIDATION:PASS")
+    queue_entry(|| {
+        let tools = app.window("tools", || Text("rejected-tools"))
+        rejected_tools = tools
+        let cx = tools.context()
+        rejected_tools_context = cx
+        cx.run(|| spawn {
+            defer {
+                sleep(2)
+                assert(window_id(cx.window()) == window_id(tools), "rejected tools must retain cleanup identity")
+                tools_cleaned = true
+            }
+            sleep(86400000)
+            late += 1
+        })
+        start_tasks(tools)
+        error("first tools replay failed", 0)
+    })
+    queue_entry(|| {
+        let tools = app.window("tools", || Text("accepted-tools"), WindowOptions.new(title: "accepted-tools"))
+        accepted_tools = tools
+        let old = rejected_tools ?? panic("missing rejected tools window")
+        assert(window_id(tools) != window_id(old), "successful same-batch retry must allocate a new window")
+        assert(!rejected_tools.is_open() && !rejected_tools_context.is_active(), "rejected window authority must detach immediately")
+        var command_denied = false
+        try { rejected_tools.title("late-rejected-title") } catch _ { command_denied = true }
+        assert(command_denied, "rejected window must not enqueue commands")
+        var run_denied = false
+        try { rejected_tools_context.run(|| nil) } catch _ { run_denied = true }
+        assert(run_denied, "rejected context must not run new work")
+        return nil
+    })
+    let retry_turn = advance_once()
+    assert(retry_turn.windows.len() == 1 && retry_turn.windows[0].title == "accepted-tools", "same-batch retry must publish its new window")
+    assert(retry_turn.commands.len() == 0)
+    let accepted = accepted_tools ?? panic("missing successful tools retry")
+    assert(retry_turn.windows[0].id == window_id(accepted), "native open must use the accepted window allocation")
+    assert(accepted.is_open() && render_now(accepted)[0].text == "accepted-tools")
+    while !tools_cleaned { advance_once(); sleep(1) }
+    assert(accepted.is_open() && accepted.context().is_active(), "rejected cleanup must not close accepted retry")
+    print("ENTRY:WINDOW_RETRY:PASS")
+    queue_entry(|| {
+        let other = application("immediate-second")
+        let unseen = other.window("hidden", || Text("hidden"))
+        retired_window = unseen
+        let cx = unseen.context()
+        cx.run(|| spawn {
+            defer {
+                sleep(250)
+                assert(cx.window() == unseen, "retired app must retain its window context")
+                retired_app_cleaned = true
+            }
+            sleep(86400000)
+            late += 1
+        })
+        start_tasks(unseen)
+        error("second app entry failed", 0)
+    })
+    let retired = advance_once()
+    assert(retired.windows.len() == 0 && retired.commands.len() == 0)
+    assert(!retired_window.is_open() && !retired_app_cleaned, "cleanup must still be pending at host return")
+    // Its public key is available immediately, even while the old root drains.
+    let retry = application("immediate-second")
+    retry_app = retry
+    retry_window = retry.window("retry", || Text("retry"))
+    return nil
+})
+app.run()
+assert(cleaned && retired_app_cleaned && late == 0 && !main.is_open())
+assert(parked_window.is_open() && parked_window.context().is_active() && !parked_cleaned, "preexisting app must remain active")
+assert(retry_window.is_open(), "successful new app outside replay must remain active")
+assert(!independent.is_closed() && independent.poll().pending, "independent group must remain active")
+dispose_test_app(parked)
+dispose_test_app(retry_app)
+independent.close()
+while independent.poll().pending { sleep(1) }
+assert(parked_cleaned)
+print("ENTRY:RETIRED:PASS")
+install_legacy_host(|| {
+    assert(legacy_render_now()[0].text == "legacy-initial")
+    queue_entry(|| nil)
+    queue_entry(|| { smoke(|| Text("legacy-rejected")); error("legacy entry failed", 0) })
+    legacy_advance_once()
+    assert(legacy_render_now()[0].text == "legacy-initial", "mixed batch must not publish rejected smoke view")
+    queue_entry(|| { smoke(|| Text("legacy-first-valid")); return nil })
+    queue_entry(|| { smoke(|| Text("legacy-second-rejected")); error("later smoke entry failed", 0) })
+    legacy_advance_once()
+    assert(legacy_render_now()[0].text == "legacy-first-valid", "later failed replay must retain earlier accepted smoke candidate")
+    queue_entry(|| { smoke(|| Text("legacy-accepted")); return nil })
+    legacy_advance_once()
+    assert(legacy_render_now()[0].text == "legacy-accepted")
+    print("ENTRY:LEGACY:PASS")
+    return nil
+})
+smoke(|| Text("legacy-initial"))
+print("ENTRY:TRANSACTION:PASS")

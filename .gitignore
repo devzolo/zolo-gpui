@@ -1,0 +1,12 @@
+/native/target/
+/target/
+/examples/target/
+/.zolo/
+/dist/
+*.exe
+*.dll
+
+
+# Generated local foreign preparation and consumer locks.
+/zolo.lock
+/examples/zolo.lock

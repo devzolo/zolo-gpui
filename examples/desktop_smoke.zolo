@@ -1,0 +1,203 @@
+//! Real-window fixture driven by scripts/verify-desktop.ps1.
+//! Receipts below are emitted only by native callbacks or owned task cleanup.
+use gpui::{application, state, Window, WindowOptions, Node, Style, Column, Text, Button, TextInput, Checkbox, Split}
+
+let smoke_app = application("desktop-smoke")
+let smoke_phase = state("desktop-smoke:phase", 0)
+let smoke_text = state("desktop-smoke:text", "")
+let smoke_checked = state("desktop-smoke:checked", false)
+let smoke_ratio = state("desktop-smoke:ratio", 0.5)
+var smoke_main: Window? = nil
+var smoke_child: Window? = nil
+var smoke_rendered_phase = -1
+var smoke_toggles = 0
+var smoke_buttons = 0
+var smoke_submits = 0
+var smoke_rejections = 0
+var smoke_nested_keys = 0
+var smoke_background_keys = 0
+var smoke_modal_open = false
+var smoke_modal_a = ""
+var smoke_modal_b = ""
+var smoke_modal_sentinel = 0
+var smoke_modal_verified = false
+var smoke_resized = false
+var smoke_main_cleaned = false
+var smoke_child_cleaned = false
+var smoke_child_pinged = false
+
+fn control_style() -> Style {
+    return Style.new(width: 560.0, height: 44.0, padding: 8.0, gap: 0.0, background: 0x27272a)
+}
+
+fn accept_text(value: str) -> Any {
+    if value.contains("x") {
+        smoke_rejections += 1
+        let main = smoke_main ?? panic("main window missing")
+        main.title("Zolo desktop verification main rejected")
+        print("DESKTOP:INPUT:REJECT:{value}")
+    } else {
+        smoke_text.value = value
+        let main = smoke_main ?? panic("main window missing")
+        main.title("Zolo desktop verification main")
+        print("DESKTOP:INPUT:ACCEPT:{value}")
+    }
+    return nil
+}
+
+fn background_key(key: str) -> Any {
+    if key == "ctrl-enter" {
+        smoke_background_keys += 1
+        print("DESKTOP:BACKGROUND_KEY:{smoke_background_keys}")
+    }
+    return nil
+}
+
+fn nested_key(key: str) -> Any {
+    if key == "ctrl-enter" {
+        smoke_nested_keys += 1
+        print("DESKTOP:NESTED_KEY:{smoke_nested_keys}")
+    }
+    return nil
+}
+
+fn dismiss_modal() -> Any {
+    assert(smoke_background_keys == 0, "a modal leaked an application shortcut")
+    assert(smoke_modal_a == "aAC" && smoke_modal_b == "b", "Tab/Shift+Tab escaped the modal inputs")
+    assert(smoke_modal_sentinel == 2, "the modal's last control was not reached through keyboard traversal")
+    smoke_modal_open = false
+    smoke_modal_verified = true
+    print("DESKTOP:MODAL:CLOSED:trap=true:key_isolation=true")
+    return nil
+}
+
+fn open_modal() -> Any {
+    smoke_modal_open = true
+    let main = smoke_main ?? panic("main window missing")
+    // This target exists only in the next tree: verify queued native focus.
+    main.focus("modal-a")
+    print("DESKTOP:MODAL:OPEN")
+    return nil
+}
+
+fn next_phase() -> Any {
+    if smoke_phase.value == 0 {
+        assert(smoke_rejections == 1 && smoke_text.value == "ação🦀日本", "controlled rejection/Unicode editing failed")
+        assert(smoke_toggles == 2 && !smoke_checked.value, "pointer/keyboard checkbox callbacks failed")
+        assert(smoke_buttons == 2 && smoke_submits == 1, "button activation or input submit failed")
+        print("DESKTOP:CONTROLS:PASS")
+    } else if smoke_phase.value == 1 {
+        assert(smoke_nested_keys == 1 && smoke_background_keys == 0, "focused nested shortcut routing failed")
+        assert(smoke_modal_verified, "modal verification did not complete")
+        print("DESKTOP:KEYBOARD:PASS")
+    } else if smoke_phase.value == 2 {
+        assert(smoke_resized && smoke_ratio.value > 0.6, "native split dragging did not resize its panes")
+        print("DESKTOP:SPLIT:PASS")
+    }
+    smoke_phase.value += 1
+    return nil
+}
+
+fn ChildWindow() -> Node {
+    print("DESKTOP:CHILD:RENDER")
+    return Column(id: "child", style: Style.new(width: 600.0, height: 440.0, padding: 20.0, gap: 12.0), children: [
+        Text("Independent child", style: Style.new(height: 28.0)),
+        Button(|| {
+            let main = smoke_main ?? panic("main window missing")
+            assert(!main.is_open() && smoke_main_cleaned, "the first window did not finish owned cleanup")
+            smoke_child_pinged = true
+            print("DESKTOP:CHILD:PING:main_open=false:cleanup=true")
+        }, id: "child-ping", style: control_style(), children: [Text("Ping after main closes")]),
+        Button(|| {
+            assert(smoke_child_pinged, "child window was not exercised after the first closed")
+            print("DESKTOP:CHILD:CLOSING")
+            let child = smoke_child ?? panic("child window missing")
+            child.close()
+        }, id: "child-close", style: control_style(), children: [Text("Close final window")]),
+    ])
+}
+
+fn open_child() -> Any {
+    assert(smoke_child == nil, "second window opened twice")
+    let child = smoke_app.window("child", ChildWindow, WindowOptions.new(title: "Zolo desktop verification child", width: 640.0, height: 520.0))
+    smoke_child = child
+    child.context().run(|| spawn {
+        defer { smoke_child_cleaned = true; print("DESKTOP:CHILD:CLEANUP") }
+        print("DESKTOP:CHILD:TASK")
+        sleep(86400000)
+        assert(false, "child task was not cancelled when its window closed")
+    })
+    print("DESKTOP:CHILD:OPEN")
+    return nil
+}
+
+fn MainWindow() -> Node {
+    let phase = smoke_phase.value
+    if smoke_rendered_phase != phase {
+        smoke_rendered_phase = phase
+        print("DESKTOP:READY:{phase}")
+    }
+    let children: [Node] = [Text("Desktop verification · phase {phase}", style: Style.new(height: 28.0))]
+    if phase == 0 {
+        children.push(TextInput(smoke_text.value, accept_text, |value| {
+            smoke_submits += 1
+            assert(value == "ação🦀日本", "submit did not receive native Unicode text")
+            print("DESKTOP:SUBMIT:{value}")
+        }, id: "edit", style: control_style()))
+        children.push(Checkbox(smoke_checked.value, |value| {
+            smoke_checked.value = value
+            smoke_toggles += 1
+            print("DESKTOP:TOGGLE:{smoke_toggles}:{value}")
+        }, "Pointer then Space", id: "check", style: control_style()))
+        children.push(Button(|| { smoke_buttons += 1; print("DESKTOP:BUTTON:{smoke_buttons}") }, id: "action", style: control_style(), children: [Text("Pointer then Enter")]))
+        children.push(Button(next_phase, id: "next", style: control_style(), children: [Text("Continue")]))
+    } else if phase == 1 {
+        children.push(Column(id: "editor", on_key: nested_key, style: Style.new(width: 560.0, height: 44.0, gap: 0.0), children: [
+            TextInput(id: "nested-edit", style: control_style()),
+        ]))
+        children.push(Button(open_modal, id: "open-dialog", style: control_style(), children: [Text("Open modal")]))
+        children.push(Button(next_phase, id: "next", style: control_style(), children: [Text("Continue")]))
+        if smoke_modal_open {
+            children.push(Node.new(kind: "modal", key: "dialog", on_dismiss: dismiss_modal, children: [
+                Column(id: "modal-body", style: Style.new(width: 400.0, height: 200.0, gap: 12.0), children: [
+                    TextInput(smoke_modal_a, |value| { smoke_modal_a = value; print("DESKTOP:MODAL:A:{value}") }, id: "modal-a", style: Style.new(width: 400.0, height: 44.0, padding: 8.0)),
+                    TextInput(smoke_modal_b, |value| { smoke_modal_b = value; print("DESKTOP:MODAL:B:{value}") }, id: "modal-b", style: Style.new(width: 400.0, height: 44.0, padding: 8.0)),
+                    Button(|| { smoke_modal_sentinel += 1; print("DESKTOP:MODAL:SENTINEL:{smoke_modal_sentinel}") }, id: "modal-last", style: Style.new(width: 400.0, height: 44.0, padding: 8.0), children: [Text("Modal last control")]),
+                ]),
+            ]))
+        }
+    } else if phase == 2 {
+        children.push(Split(smoke_ratio.value, |ratio| {
+            assert(ratio > 0.0 && ratio < 1.0, "split callback delivered an invalid ratio")
+            smoke_ratio.value = ratio
+            if ratio > 0.6 { smoke_resized = true; print("DESKTOP:SPLIT:RESIZED") }
+        }, id: "panes", style: Style.new(width: 560.0, height: 220.0, gap: 0.0), children: [
+            Column(style: Style.new(background: 0x26344b), children: [Text("First pane")]),
+            Column(style: Style.new(background: 0x3b2b43), children: [Text("Second pane")]),
+        ]))
+        children.push(Button(next_phase, id: "next", style: control_style(), children: [Text("Continue")]))
+    } else {
+        children.push(Button(open_child, id: "open-child", style: control_style(), children: [Text("Open independent window")]))
+        children.push(Button(|| {
+            let child = smoke_child ?? panic("child window missing")
+            assert(child.is_open(), "dynamic second window did not open")
+            print("DESKTOP:MAIN:CLOSING")
+            let main = smoke_main ?? panic("main window missing")
+            main.close()
+        }, id: "close-main", style: control_style(), children: [Text("Close main window")]))
+    }
+    return Column(id: "main", on_key: background_key, style: Style.new(width: 600.0, height: 480.0, padding: 20.0, gap: 12.0), children: children)
+}
+
+let main = smoke_app.window("main", MainWindow, WindowOptions.new(title: "Zolo desktop verification main", width: 640.0, height: 520.0))
+smoke_main = main
+main.context().run(|| spawn {
+    defer { smoke_main_cleaned = true; print("DESKTOP:MAIN:CLEANUP") }
+    print("DESKTOP:MAIN:TASK")
+    sleep(86400000)
+    assert(false, "main task was not cancelled when its window closed")
+})
+smoke_app.run()
+assert(smoke_child_pinged && smoke_main_cleaned && smoke_child_cleaned, "real multiwindow shutdown did not drain owned tasks")
+assert(smoke_phase.value == 3 && smoke_modal_verified && smoke_resized)
+print("DESKTOP:PASS:controls:unicode:keyboard:modal:split:multiwindow:cleanup")

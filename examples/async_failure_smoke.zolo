@@ -1,0 +1,31 @@
+use gpui::{smoke, Node, Column, Button, Style}
+
+var cleaned = 0
+var late_delivery = 0
+async fn fail_soon() {
+    sleep(100)
+    panic("original asynchronous event failure")
+}
+async fn sibling() {
+    defer { cleaned += 1 }
+    sleep(5000)
+    late_delivery += 1
+}
+fn start() {
+    sibling()
+    fail_soon()
+}
+fn FailureSmoke() -> Node {
+    <Column style={Style.new(padding: 12.0)}>
+        <Button on_click={start}>Start failing async event</Button>
+    </Column>
+}
+var reported = false
+try { smoke(FailureSmoke, x: 40.0, y: 40.0) }
+catch failure {
+    reported = tostring(failure).contains("original asynchronous event failure")
+}
+assert(reported, "the original async event failure reaches the caller")
+assert_eq(cleaned, 1)
+assert_eq(late_delivery, 0)
+print("async event failure cancels siblings, drains cleanup and preserves the original error: ok")

@@ -1,0 +1,21 @@
+[package]
+name = "zolo-gpui-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+# Development checks only. Consumers compile this source through extern rust.
+[lib]
+path = "bridge.rs"
+
+[dependencies]
+gpui = "=0.2.2"
+
+
+unicode-segmentation = "=1.13.3"
+
+pulldown-cmark = "=0.13.4"
+
+[features]
+test-support = ["gpui/test-support"]

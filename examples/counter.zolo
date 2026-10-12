@@ -1,0 +1,20 @@
+use gpui::{run, state, Node, Column, Row, Text, Button, Style}
+
+let count = state("counter", 0)
+
+fn Counter() -> Node {
+    <Column style={Style.new(padding: 24.0, gap: 16.0)}>
+        <Text value="Zolo + GPUI" style={Style.new(font_size: 28.0)} />
+        <Text value={"Contador: {count.value}"} />
+        <Row>
+            <Button key="decrement" on_click={|| { count.value -= 1 }}>
+                Diminuir
+            </Button>
+            <Button key="increment" on_click={|| { count.value += 1 }}>
+                Aumentar
+            </Button>
+        </Row>
+    </Column>
+}
+
+run(Counter, title: "Contador Zolo", width: 640.0, height: 360.0)

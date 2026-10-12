@@ -1,0 +1,1129 @@
+//! Native desktop components. Tags and builders use the same functions.
+use std::ui::{collect, begin_updates, poll_updates, end_updates}
+use std::async::{task_group, TaskGroup}
+use plugin rust::{rust}
+
+extern rust deps {
+    "gpui" = "0.2.2"
+    "unicode-segmentation" = "1.13.3"
+    "pulldown-cmark" = "0.13.4"
+}
+
+extern rust from "../native/bridge.rs" use {run_tasks as native_run, probe as native_probe, smoke_tasks as native_smoke, desktop as native_desktop,
+    validate_desktop as native_validate}
+
+/// A named state cell survives source reloads within the current dev session.
+/// Keep its key stable while editing the view; a fresh process resets it.
+pub struct State<T> {
+    pub value: T {
+        get { state_read(self); return field }
+        set(next) { state_read(self); field = next; state_changed(self) }
+    },
+}
+impl State {
+    /// Return a replacement value after editing a nested model, array or map.
+    pub fn update(self, edit: fn(T) -> T) { self.value = edit(self.value) }
+    pub fn subscribe(self, changed: fn() -> Any) -> Subscription { return watch_state(self, changed) }
+}
+struct StateOwner {
+    windows: #{Window: bool} = #{},
+    components: #{ComponentHandle: bool} = #{},
+    subscriptions: [Subscription] = [],
+}
+struct StateSlot { schema: str, cell: Any }
+struct FrameStateAdmission { key: str, cell: Any }
+var states: #{str: StateSlot} = #{}
+var state_owners: #{Any: StateOwner} = #{}
+
+// Names are authored strings, including paths. Escape each segment before
+// composing identities; '~' is reserved for positional native children.
+fn key_segment(value: str) -> str {
+    return value.replace("%", "%25").replace("/", "%2F").replace("~", "%7E")
+}
+
+@reify(T)
+pub fn state<T>(key: str, initial: T) -> State<T> {
+    let schema = typeinfo(T).key
+    var scoped = "global/{key_segment(key)}"
+    if rendering_window != nil {
+        let window = window_data(rendering_window)
+        let owner = app_data(window.app)
+        let component = if rendering_component == nil { "root" } else { component_registry[rendering_component].key }
+        scoped = "window/{key_segment(owner.key)}/{key_segment(window.key)}/{component}/{key_segment(key)}"
+    }
+    if scoped in states {
+        let old = states[scoped]
+        assert(old.schema == schema, "state '{scoped}' changed type; use a new key or restart the session")
+        return old.cell
+    }
+    let cell = State.new(value: initial)
+    states[scoped] = StateSlot.new(schema: schema, cell: cell)
+    state_owners[cell] = StateOwner.new()
+    if rendering_window != nil {
+        let frame = window_data(rendering_window)
+        if frame.staging { frame.state_admissions.push(FrameStateAdmission.new(key: scoped, cell: cell)) }
+    }
+    return cell
+}
+
+fn state_read(cell: Any) {
+    assert(cell in state_owners, "state must be created with state()")
+    let owner = state_owners[cell]
+    if rendering_window != nil { owner.windows[rendering_window] = true }
+    if rendering_component != nil { owner.components[rendering_component] = true }
+}
+
+fn state_changed(cell: Any) {
+    let owner = state_owners[cell]
+    for window, _ in owner.windows { if window in window_registry { window_data(window).dirty = true } }
+    for component, _ in owner.components {
+        invalidate_component(component)
+    }
+    let listeners = owner.subscriptions
+    for subscription in listeners {
+        if subscription in subscription_registry {
+            let listener = subscription_registry[subscription]
+            if !listener.tasks.is_closed() {
+                listener.context.run(|| {
+                    let result = listener.changed()
+                    spawn { await result }
+                })
+            }
+        }
+    }
+}
+
+fn invalidate_component(component: ComponentHandle) {
+    var current: ComponentHandle? = component
+    while current != nil && current in component_registry {
+        let data = component_registry[current]
+        data.dirty = true
+        if data.window in window_registry { window_data(data.window).dirty = true }
+        current = data.parent
+    }
+}
+
+// One native window owns these callbacks until run returns. Re-running the
+// entry stages a replacement view, never recursively opens another window.
+var active = false
+var current_view: Any = nil
+var pending_view: Any = nil
+
+pub struct Style {
+    gap: float = 8.0,
+    padding: float = 0.0,
+    background: int = -1,
+    color: int = -1,
+    radius: float = 0.0,
+    font_size: float = 16.0,
+    width: float = -1.0,
+    height: float = -1.0,
+    grow: float = 0.0,
+    shrink: float = 1.0,
+}
+
+@naming(returns: [.SnakeCase, .PascalCase])
+pub struct Node {
+    kind: str,
+    key: str = "",
+    attrs: #{str: Any} = #{},
+    text: str = "",
+    style: Style = Style.new(),
+    on_click: (fn() -> Any)? = nil,
+    on_change: (fn(str) -> Any)? = nil,
+    on_toggle: (fn(bool) -> Any)? = nil,
+    on_submit: (fn(str) -> Any)? = nil,
+    on_resize: (fn(float) -> Any)? = nil,
+    on_key: (fn(str) -> Any)? = nil,
+    on_link: (fn(str) -> Any)? = nil,
+    on_action: (fn(str) -> Any)? = nil,
+    on_dismiss: (fn() -> Any)? = nil,
+    ratio: float = 0.5,
+    vertical: bool = false,
+    source: str = "",
+    language: str = "",
+    action: str = "",
+    tooltip: str = "",
+    runs: [TextSpan] = [],
+    primitives: [CanvasPrimitive] = [],
+    placeholder: str = "",
+    disabled: bool = false,
+    read_only: bool = false,
+    checked: bool = false,
+    multiline: bool = false,
+    submit_on_enter: bool = true,
+    children: [Node] = [],
+}
+
+struct NativeNode {
+    kind: str,
+    key: str,
+    text: str,
+    style: Style,
+    event: int,
+    children: [NativeNode],
+}
+
+struct NativePoll {
+    changed: bool,
+    pending: bool,
+    next_ms: float,
+}
+
+fn append(value: Any, out: [Node]) {
+    if value is nil { return }
+    if value is Node { out.push(value); return }
+    if value is table {
+        for item in value { append(item, out) }
+        return
+    }
+    out.push(Node.new(kind: "text", text: tostring(value)))
+}
+
+fn children_of(children: Any) -> [Node] {
+    var out: [Node] = []
+    for value in collect(children) { append(value, out) }
+    return out
+}
+
+pub fn Column(id: str = "", style: Style = Style.new(), on_key: (fn(str) -> Any)? = nil, children: Any = nil) -> Node {
+    return Node.new(kind: "column", key: id, style: style, on_key: on_key, children: children_of(children))
+}
+
+pub fn Row(id: str = "", style: Style = Style.new(), children: Any = nil) -> Node {
+    return Node.new(kind: "row", key: id, style: style, children: children_of(children))
+}
+
+pub fn Text(value: Any = "", id: str = "", style: Style = Style.new(), children: Any = nil) -> Node {
+    return Node.new(kind: "text", key: id, text: tostring(value), style: style, children: children_of(children))
+}
+
+pub fn Button(on_click: fn() -> Any, id: str = "", disabled: bool = false, tooltip: str = "", style: Style = Style.new(padding: 12.0, background: 0x2563eb, radius: 6.0), children: Any = nil) -> Node {
+    return Node.new(kind: "button", key: id, style: style, on_click: on_click, disabled: disabled, tooltip: tooltip, children: children_of(children))
+}
+
+pub fn Fragment(children: Any = nil) -> Node {
+    return Node.new(kind: "fragment", children: children_of(children))
+}
+
+fn encode(node: Node, handlers: [Any], path: str) -> NativeNode {
+    var event = 0
+    if node.on_click is function {
+        handlers.push(node.on_click)
+        event = handlers.len()
+    }
+    var children: [NativeNode] = []
+    var index = 0
+    for child in node.children {
+        children.push(encode(child, handlers, "{path}/{index}"))
+        index += 1
+    }
+    let declared_key = if "key" in node.attrs { tostring(node.attrs["key"]) } else { node.key }
+    let key = if declared_key == "" { path } else { declared_key }
+    return NativeNode.new(kind: node.kind, key: key, text: node.text, style: node.style, event: event, children: children)
+}
+
+/// Run on the application's main thread. Closing the last window returns.
+pub fn run(view: fn() -> Node, title: str = "Zolo GPUI", width: float = 640.0, height: float = 480.0) {
+    let app = application("__run")
+    app.window("main", view, WindowOptions.new(title: title, width: width, height: height))
+    app.run()
+}
+
+fn run_owned(view: fn() -> Node, title: str, width: float, height: float, testing: bool, x: float, y: float) {
+    if active {
+        pending_view = view
+        return
+    }
+    active = true
+    current_view = view
+    let updates = begin_updates()
+    let tasks = task_group()
+    var handlers: [Any] = []
+    let render = || {
+        while handlers.len() > 0 { handlers.pop() }
+        return tasks.run(|| [encode(current_view(), handlers, "root")])
+    }
+    let dispatch = |id: int| {
+        if tasks.is_closed() { return nil }
+        if id > 0 && id <= handlers.len() {
+            let handler = handlers[id - 1]
+            tasks.run(|| {
+                let result = handler()
+                // Observe async errors through an owned task so the driver can
+                // cancel siblings and drain cleanup before reporting failure.
+                spawn { await result }
+            })
+        }
+        return nil
+    }
+    let update = || {
+        pending_view = nil
+        let changed = if tasks.is_closed() { false } else { poll_updates(snapshot_entry_updates, finish_entry_updates) }
+        if changed && pending_view is function { current_view = pending_view }
+        pending_view = nil
+        let turn = tasks.poll()
+        return NativePoll.new(changed: !tasks.is_closed() && (changed || turn.resumed > 0), pending: turn.pending, next_ms: turn.next_ms ?? 16.0)
+    }
+    let close = || {
+        tasks.close()
+        return tasks.poll().pending
+    }
+    try {
+        if testing { native_smoke(render, dispatch, update, close, x, y) }
+        else { native_run(title, width, height, updates, render, dispatch, update, close) }
+    } catch e {
+        end_updates()
+        active = false
+        current_view = nil
+        tasks.close()
+        while tasks.poll().pending { sleep(1) }
+        error(e, 0)
+    }
+    tasks.close()
+    while tasks.poll().pending { sleep(1) }
+    end_updates()
+    active = false
+    current_view = nil
+}
+
+/// Exercise a render and optional event without opening a native window.
+pub fn probe(view: fn() -> Node, event: int = 0) -> Any {
+    var handlers: [Any] = []
+    let render = || {
+        while handlers.len() > 0 { handlers.pop() }
+        return [encode(view(), handlers, "root")]
+    }
+    let dispatch = |id: int| {
+        if id > 0 && id <= handlers.len() {
+            let handler = handlers[id - 1]
+            handler()
+        }
+        return nil
+    }
+    return native_probe(render, dispatch, event)
+}
+
+/// Opens a real window, clicks the given client position and closes it.
+/// Intended for explicit integration tests on machines with a display.
+pub fn smoke(view: fn() -> Node, x: float = 40.0, y: float = 40.0) {
+    run_owned(view, "Zolo GPUI smoke test", 400.0, 240.0, true, x, y)
+}
+
+/// Native identities are admitted by private allocation maps, never by fields.
+pub struct App() {
+    pub fn window(self, key: str, view: fn() -> Node, options: WindowOptions = WindowOptions.new()) -> Window {
+        return open_window(self, key, view, options)
+    }
+    pub fn run(self) { run_application(self) }
+    pub fn quit(self) {
+        let owner = app_data(self)
+        for window in owner.windows { if window in window_registry { window.close() } }
+    }
+}
+
+pub struct WindowOptions {
+    title: str = "Zolo GPUI",
+    width: float = 960.0,
+    height: float = 720.0,
+    resizable: bool = true,
+    minimizable: bool = true,
+}
+
+pub struct Window() {
+    pub fn close(self) { command(self, "close") }
+    pub fn title(self, value: str) { command(self, "title", value) }
+    pub fn resize(self, width: float, height: float) {
+        assert(width > 0.0 && height > 0.0, "window dimensions must be positive")
+        command(self, "resize", "", width, height)
+    }
+    pub fn focus(self, key: str) { command(self, "focus", key) }
+    pub fn notify(self) {
+        let data = window_data(self)
+        data.dirty = true
+        for _, component in data.components { invalidate_component(component) }
+    }
+    pub fn last_error(self) -> str { return window_data(self).render_error }
+    pub fn context(self) -> Context { return window_data(self).context }
+    pub fn is_open(self) -> bool { return self in window_registry && !window_registry[self].closed && !window_registry[self].reload_rejected }
+}
+
+/// Durable Zolo capability: native borrows never cross await or this boundary.
+pub struct Context() {
+    pub fn is_active(self) -> bool {
+        return self in context_registry && !context_registry[self].tasks.is_closed() && context_registry[self].window.is_open()
+    }
+    pub fn window(self) -> Window {
+        assert(self in context_registry, "context is closed or was not created by the application")
+        let window = context_registry[self].window
+        window_data(window)
+        return window
+    }
+    pub fn notify(self) {
+        let window = self.window()
+        let data = context_registry[self]
+        let component = data.component
+        if component != nil { invalidate_component(component) }
+        else { window.notify() }
+    }
+    pub fn focus(self, key: str) { self.window().focus(key) }
+    pub fn run<T>(self, body: fn() -> T) -> T {
+        let window = self.window()
+        let data = context_registry[self]
+        assert(window.is_open() && !data.tasks.is_closed(), "context is closing")
+        let previous_window = rendering_window
+        let previous_component = rendering_component
+        rendering_window = window
+        rendering_component = data.component
+        defer { rendering_window = previous_window; rendering_component = previous_component }
+        return data.tasks.run(body)
+    }
+}
+struct ContextData { window: Window, component: ComponentHandle?, tasks: TaskGroup }
+
+pub struct Subscription() {
+    pub fn dispose(self) {
+        if !(self in subscription_registry) { return }
+        let data = subscription_registry[self]
+        subscription_registry.remove(self)
+        let keep: [Subscription] = []
+        for item in state_owners[data.cell].subscriptions { if item in subscription_registry { keep.push(item) } }
+        state_owners[data.cell].subscriptions = keep
+    }
+    pub fn is_active(self) -> bool { return self in subscription_registry }
+}
+struct SubscriptionData { cell: Any, window: Window, component: ComponentHandle?, context: Context, tasks: TaskGroup, changed: fn() -> Any }
+
+pub struct Entity<T> {
+    cell: State<T>,
+}
+impl Entity {
+    pub fn read(self) -> T { return self.cell.value }
+    pub fn update(self, edit: fn(T) -> T) { self.cell.update(edit) }
+    pub fn subscribe(self, changed: fn() -> Any) -> Subscription { return self.cell.subscribe(changed) }
+}
+
+@reify(T)
+pub fn entity<T>(key: str, initial: T) -> Entity<T> { return Entity.new(cell: state(key, initial)) }
+
+pub struct ComponentHandle() {}
+struct ComponentData {
+    window: Window,
+    parent: ComponentHandle?,
+    context: Context,
+    key: str,
+    render: fn() -> Node,
+    cached: Node,
+    tasks: TaskGroup,
+    dirty: bool = true,
+    visited: bool = false,
+    subscriptions: [Subscription] = [],
+}
+struct WindowData {
+    app: App,
+    id: int,
+    key: str,
+    view: fn() -> Node,
+    options: WindowOptions,
+    context: Context,
+    view_context: Context,
+    tasks: TaskGroup,
+    view_tasks: TaskGroup,
+    pending_view: (fn() -> Node)? = nil,
+    cached_tree: [DesktopNode] = [],
+    render_error: str = "",
+    dirty: bool = true,
+    closed: bool = false,
+    reload_rejected: bool = false,
+    handlers: #{str: Handlers} = #{},
+    components: #{str: ComponentHandle} = #{},
+    subscriptions: [Subscription] = [],
+    staging: bool = false,
+    state_admissions: [FrameStateAdmission] = [],
+}
+struct RetiredFrame { tasks: TaskGroup, cells: [Any] }
+struct AppData {
+    key: str,
+    tasks: TaskGroup,
+    running: bool = false,
+    updates: bool = false,
+    windows: [Window] = [],
+    queued: [DesktopWindow] = [],
+    commands: [DesktopCommand] = [],
+    retired_frames: [RetiredFrame] = [],
+}
+struct Handlers {
+    click: (fn() -> Any)?,
+    change: (fn(str) -> Any)?,
+    toggle: (fn(bool) -> Any)?,
+    submit: (fn(str) -> Any)?,
+    resize: (fn(float) -> Any)?,
+    key: (fn(str) -> Any)?,
+    link: (fn(str) -> Any)?,
+    action: (fn(str) -> Any)?,
+    dismiss: (fn() -> Any)?,
+    component: ComponentHandle?,
+    tasks: TaskGroup,
+}
+struct DesktopWindow { id: int, title: str, width: float, height: float, resizable: bool, minimizable: bool }
+struct DesktopEvent { window: int, node: str, kind: str, text: str, number: float, checked: bool, key: str }
+struct DesktopCommand { window: int, kind: str, text: str = "", width: float = 0.0, height: float = 0.0 }
+struct DesktopPoll { window: int, changed: bool, pending: bool, next_ms: float }
+struct DesktopTurn { windows: [DesktopWindow], commands: [DesktopCommand], polls: [DesktopPoll] }
+struct ReloadWindow { pending_view: (fn() -> Node)?, dirty: bool }
+struct ReloadApp { queued: [DesktopWindow], commands: [DesktopCommand] }
+struct ReloadSnapshot { windows: #{Window: ReloadWindow}, apps: #{App: ReloadApp}, keys: #{str: App}, legacy_pending_view: Any }
+struct DesktopNode {
+    kind: str, key: str, text: str, placeholder: str, style: Style,
+    disabled: bool, read_only: bool, checked: bool, multiline: bool,
+    submit_on_enter: bool, ratio: float, vertical: bool, source: str,
+    language: str, action: str, tooltip: str, accepts_keys: bool, runs: [TextSpan], primitives: [CanvasPrimitive], children: [DesktopNode],
+}
+var app_registry: #{App: AppData} = #{}
+var window_registry: #{Window: WindowData} = #{}
+var context_registry: #{Context: ContextData} = #{}
+var component_registry: #{ComponentHandle: ComponentData} = #{}
+var subscription_registry: #{Subscription: SubscriptionData} = #{}
+var application_keys: #{str: App} = #{}
+var next_window = 1
+var active_app: App? = nil
+var rendering_window: Window? = nil
+var rendering_component: ComponentHandle? = nil
+var rejected_reload_windows: [Window] = []
+var rejected_reload_apps: [App] = []
+
+pub fn application(key: str = "main") -> App {
+    if key in application_keys {
+        let old = application_keys[key]
+        if old in app_registry && app_registry[old].running { return old }
+    }
+    let app = App.new()
+    app_registry[app] = AppData.new(key: key, tasks: task_group())
+    application_keys[key] = app
+    return app
+}
+
+pub fn context() -> Context {
+    let window = rendering_window ?? panic("context() requires a render or event callback")
+    if rendering_component != nil { return component_registry[rendering_component].context }
+    return window_data(window).view_context
+}
+
+fn app_data(app: App) -> AppData {
+    assert(app in app_registry, "application handle is closed or was not created by application()")
+    return app_registry[app]
+}
+fn window_data(window: Window) -> WindowData {
+    assert(window in window_registry, "window handle is closed or was not created by App.window()")
+    return window_registry[window]
+}
+fn window_for(app: App, id: int) -> Window? {
+    for window in app_data(app).windows {
+        if window in window_registry && window_registry[window].id == id { return window }
+    }
+    return nil
+}
+fn command(window: Window, kind: str, text: str = "", width: float = 0.0, height: float = 0.0) {
+    let owner = window_data(window)
+    assert(!owner.closed && !owner.reload_rejected, "window is closing or was rejected by source reload")
+    app_data(owner.app).commands.push(DesktopCommand.new(window: owner.id, kind: kind, text: text, width: width, height: height))
+}
+fn open_window(app: App, key: str, view: fn() -> Node, options: WindowOptions) -> Window {
+    let owner = app_data(app)
+    for window in owner.windows {
+        if window in window_registry && !window_registry[window].reload_rejected && window_registry[window].key == key {
+            let data = window_registry[window]
+            assert(!data.closed, "cannot replace a closing window")
+            data.pending_view = view
+            data.dirty = true
+            return window
+        }
+    }
+    assert(options.width > 0.0 && options.height > 0.0, "window dimensions must be positive")
+    let window = Window.new()
+    let cx = Context.new()
+    let view_cx = Context.new()
+    let id = next_window
+    next_window += 1
+    let tasks = owner.tasks.run(task_group)
+    let view_tasks = tasks.run(task_group)
+    window_registry[window] = WindowData.new(app: app, id: id, key: key, view: view, options: options, context: cx, view_context: view_cx, tasks: tasks, view_tasks: view_tasks)
+    context_registry[cx] = ContextData.new(window: window, component: nil, tasks: tasks)
+    context_registry[view_cx] = ContextData.new(window: window, component: nil, tasks: view_tasks)
+    owner.windows.push(window)
+    owner.queued.push(DesktopWindow.new(id: id, title: options.title, width: options.width, height: options.height, resizable: options.resizable, minimizable: options.minimizable))
+    return window
+}
+
+fn watch_state(cell: Any, changed: fn() -> Any) -> Subscription {
+    state_read(cell)
+    let cx = context()
+    let data = context_registry[cx]
+    let subscription = Subscription.new()
+    subscription_registry[subscription] = SubscriptionData.new(cell: cell, window: data.window, component: data.component, context: cx, tasks: data.tasks, changed: changed)
+    state_owners[cell].subscriptions.push(subscription)
+    if rendering_component != nil { component_registry[rendering_component].subscriptions.push(subscription) }
+    else if rendering_window != nil { window_data(rendering_window).subscriptions.push(subscription) }
+    return subscription
+}
+
+/// Cache a component by an explicit identity. Its reads invalidate this cache;
+/// its tasks and subscriptions are cancelled/disposed when it leaves the tree.
+pub fn Component(id: str, view: fn() -> Node) -> Node {
+    assert(id != "", "Component requires a stable nonempty id")
+    let window = rendering_window ?? panic("Component requires an application render")
+    let data = window_data(window)
+    let parent = if rendering_component == nil { "root" } else { component_registry[rendering_component].key }
+    let parent_tasks = if rendering_component == nil { data.view_tasks } else { component_registry[rendering_component].tasks }
+    let key = "{parent}/{key_segment(id)}"
+    if !(key in data.components) {
+        let component_id = ComponentHandle.new()
+        let cx = Context.new()
+        let tasks = parent_tasks.run(task_group)
+        data.components[key] = component_id
+        component_registry[component_id] = ComponentData.new(window: window, parent: rendering_component, context: cx, key: key, render: view, cached: Node.new(kind: "fragment"), tasks: tasks)
+        context_registry[cx] = ContextData.new(window: window, component: component_id, tasks: tasks)
+    }
+    let component_id = data.components[key]
+    let component = component_registry[component_id]
+    component.visited = true
+    if component.render != view { component.dirty = true }
+    component.render = view
+    if component.tasks.is_closed() {
+        component.tasks = parent_tasks.run(task_group)
+        context_registry[component.context].tasks = component.tasks
+        component.dirty = true
+    }
+    if component.dirty {
+        for subscription in component.subscriptions { subscription.dispose() }
+        component.subscriptions = []
+        for _, owner in state_owners { owner.components.remove(component_id) }
+        let previous = rendering_component
+        rendering_component = component_id
+        defer { rendering_component = previous }
+        component.cached = component.tasks.run(view)
+        component.dirty = false
+    }
+    let node = Node.new(kind: "fragment", key: id, children: [component.cached])
+    node.attrs["__component"] = component_id
+    return node
+}
+
+fn dispose_component(component_id: ComponentHandle) {
+    if !(component_id in component_registry) { return }
+    let data = component_registry[component_id]
+    data.tasks.close()
+    for subscription in data.subscriptions { subscription.dispose() }
+    for _, owner in state_owners { owner.components.remove(component_id) }
+    context_registry.remove(data.context)
+    component_registry.remove(component_id)
+}
+
+fn desktop_encode(node: Node, owner: WindowData, path: str, tasks: TaskGroup, inherited_component: ComponentHandle? = nil) -> DesktopNode {
+    var current_tasks = tasks
+    var component_owner: ComponentHandle? = inherited_component
+    if "__component" in node.attrs {
+        let component_id = node.attrs["__component"]
+        assert(component_id in component_registry, "component ownership is invalid")
+        let component = component_registry[component_id]
+        component.visited = true
+        assert(window_data(component.window).id == owner.id, "component belongs to another window")
+        current_tasks = component.tasks
+        component_owner = component_id
+    }
+    let declared = if "key" in node.attrs { tostring(node.attrs["key"]) } else { node.key }
+    let key = if declared == "" { path } else { "{path}/{key_segment(declared)}" }
+    assert(!(key in owner.handlers), "duplicate component key '{key}'")
+    owner.handlers[key] = Handlers.new(click: node.on_click, change: node.on_change, toggle: node.on_toggle, submit: node.on_submit,
+        resize: node.on_resize, key: node.on_key, link: node.on_link, action: node.on_action, dismiss: node.on_dismiss, component: component_owner, tasks: current_tasks)
+    var children: [DesktopNode] = []
+    var index = 0
+    for child in node.children {
+        let local = if "key" in child.attrs { tostring(child.attrs["key"]) } else { child.key }
+        let child_path = if local == "" { "{key}/~{index}" } else { key }
+        children.push(desktop_encode(child, owner, child_path, current_tasks, component_owner))
+        index += 1
+    }
+    return DesktopNode.new(kind: node.kind, key: key, text: node.text, placeholder: node.placeholder, style: node.style,
+        disabled: node.disabled, read_only: node.read_only, checked: node.checked, multiline: node.multiline,
+        submit_on_enter: node.submit_on_enter, ratio: node.ratio, vertical: node.vertical, source: node.source,
+        language: node.language, action: node.action, tooltip: node.tooltip, accepts_keys: node.on_key != nil, runs: node.runs, primitives: node.primitives, children: children)
+}
+
+fn desktop_render(app: App, id: int) -> [DesktopNode] {
+    let window = window_for(app, id)
+    if window == nil { return [] }
+    let data = window_data(window)
+    if data.closed || data.reload_rejected { return [] }
+    if data.pending_view == nil { return render_frame(window, data) }
+    let replacement = data.pending_view ?? panic("missing replacement view")
+    let previous_dependencies: [Any] = []
+    for cell, owner in state_owners { if window in owner.windows { previous_dependencies.push(cell) } }
+    let view_tasks = data.tasks.run(task_group)
+    let view_cx = Context.new()
+    let candidate = WindowData.new(app: data.app, id: data.id, key: data.key, view: replacement, options: data.options,
+        context: data.context, view_context: view_cx, tasks: data.tasks, view_tasks: view_tasks, staging: true)
+    context_registry[view_cx] = ContextData.new(window: window, component: nil, tasks: view_tasks)
+    window_registry[window] = candidate
+    try {
+        let tree = render_frame(window, candidate)
+        candidate.staging = false
+        candidate.state_admissions = []
+        release_frame(data)
+        return tree
+    } catch failure {
+        window_registry[window] = data
+        release_frame(candidate)
+        let retired_cells: [Any] = []
+        for admission in candidate.state_admissions {
+            if admission.key in states && states[admission.key].cell == admission.cell { states.remove(admission.key) }
+            let owner = state_owners[admission.cell]
+            owner.windows.clear()
+            owner.components.clear()
+            for subscription in owner.subscriptions { subscription.dispose() }
+            owner.subscriptions = []
+            retired_cells.push(admission.cell)
+        }
+        if retired_cells.len() > 0 {
+            app_data(app).retired_frames.push(RetiredFrame.new(tasks: candidate.view_tasks, cells: retired_cells))
+        }
+        for _, owner in state_owners { owner.windows.remove(window) }
+        for cell in previous_dependencies { state_owners[cell].windows[window] = true }
+        data.pending_view = nil
+        data.render_error = tostring(failure)
+        if !app_data(app).updates { error(failure, 0) }
+        print("GPUI: replacement view rejected: {data.render_error}")
+        return data.cached_tree
+    }
+}
+
+fn release_frame(data: WindowData) {
+    data.view_tasks.close()
+    context_registry.remove(data.view_context)
+    for _, component in data.components { dispose_component(component) }
+    for subscription in data.subscriptions { subscription.dispose() }
+}
+
+// Rejected names are removed immediately, while detached cell capabilities
+// remain available to the rejected frame's awaited cancellation cleanup.
+// Poll only at ordinary app boundaries, and retire each frame independently
+// of other still-running window or application tasks.
+fn retire_frames(owner: AppData) {
+    let pending: [RetiredFrame] = []
+    for frame in owner.retired_frames {
+        if frame.tasks.poll().pending { pending.push(frame) }
+        else { for cell in frame.cells { state_owners.remove(cell) } }
+    }
+    owner.retired_frames = pending
+}
+
+fn render_frame(window: Window, data: WindowData) -> [DesktopNode] {
+    let previous = rendering_window
+    rendering_window = window
+    defer { rendering_window = previous }
+    for _, owner in state_owners { owner.windows.remove(window) }
+    for subscription in data.subscriptions { subscription.dispose() }
+    data.subscriptions = []
+    for _, component_id in data.components { if component_id in component_registry { component_registry[component_id].visited = false } }
+    data.handlers.clear()
+    let node = data.view_tasks.run(data.view)
+    let tree = desktop_encode(node, data, "root", data.view_tasks)
+    let invalid = native_validate([tree])
+    assert(invalid == "", invalid)
+    let unmounted: [str] = []
+    for key, component_id in data.components {
+        if component_id in component_registry && !component_registry[component_id].visited { unmounted.push(key); dispose_component(component_id) }
+    }
+    for key in unmounted { data.components.remove(key) }
+    data.cached_tree = [tree]
+    data.render_error = ""
+    return data.cached_tree
+}
+
+fn desktop_dispatch(app: App, events: [DesktopEvent]) {
+    for event in events {
+        let window = window_for(app, event.window)
+        if window == nil { continue }
+        let data = window_data(window)
+        if data.closed || data.reload_rejected || !(event.node in data.handlers) { continue }
+        let handler = data.handlers[event.node]
+        if handler.tasks.is_closed() { continue }
+        let previous = rendering_window
+        let previous_component = rendering_component
+        rendering_window = window
+        rendering_component = handler.component
+        try {
+            handler.tasks.run(|| {
+                let result: Any = if event.kind == "change" {
+                    if handler.toggle != nil { handler.toggle(event.checked) }
+                    else if handler.change != nil { handler.change(event.text) } else { nil }
+                } else if event.kind == "submit" {
+                    if handler.submit != nil { handler.submit(event.text) } else { nil }
+                } else if event.kind == "resize" {
+                    if handler.resize != nil { handler.resize(event.number) } else { nil }
+                } else if event.kind == "key" {
+                    if handler.key != nil { handler.key(event.key) } else { nil }
+                } else if event.kind == "link" {
+                    if handler.link != nil { handler.link(event.text) } else { nil }
+                } else if event.kind == "action" {
+                    if handler.action != nil { handler.action(event.text) } else { nil }
+                } else if event.kind == "dismiss" {
+                    if handler.dismiss != nil { handler.dismiss() } else { nil }
+                } else { if handler.click != nil { handler.click() } else { nil } }
+                spawn { await result }
+            })
+            data.dirty = true
+        } catch e {
+            rendering_window = previous
+            rendering_component = previous_component
+            error(e, 0)
+        }
+        rendering_window = previous
+        rendering_component = previous_component
+    }
+    return nil
+}
+
+fn desktop_close(app: App, id: int) -> bool {
+    let window = window_for(app, id)
+    if window == nil { return false }
+    let data = window_data(window)
+    if !data.closed {
+        data.closed = true
+        for _, component in data.components { dispose_component(component) }
+        for subscription in data.subscriptions { subscription.dispose() }
+        data.tasks.close()
+    }
+    let pending = data.tasks.poll().pending
+    retire_frames(app_data(app))
+    if !pending {
+        context_registry.remove(data.context)
+        context_registry.remove(data.view_context)
+        window_registry.remove(window)
+        for _, owner in state_owners { owner.windows.remove(window) }
+    }
+    return pending
+}
+
+fn snapshot_entry_updates() -> Any {
+    // Each protected reexecution gets its own token, even in a mixed update batch.
+    // Preserve mutations already admitted by events or earlier successful replays.
+    let windows: #{Window: ReloadWindow} = #{}
+    for window, data in window_registry {
+        windows[window] = ReloadWindow.new(pending_view: data.pending_view, dirty: data.dirty)
+    }
+    let apps: #{App: ReloadApp} = #{}
+    for app, data in app_registry {
+        let queued: [DesktopWindow] = []
+        let commands: [DesktopCommand] = []
+        for item in data.queued { queued.push(item) }
+        for item in data.commands { commands.push(item) }
+        apps[app] = ReloadApp.new(queued: queued, commands: commands)
+    }
+    let keys: #{str: App} = #{}
+    for key, app in application_keys { keys[key] = app }
+    return ReloadSnapshot.new(windows: windows, apps: apps, keys: keys, legacy_pending_view: pending_view)
+}
+
+fn finish_entry_updates(token: Any, succeeded: bool) -> Any {
+    if succeeded { return nil }
+    let snapshot: ReloadSnapshot = token
+    pending_view = snapshot.legacy_pending_view
+    let windows = snapshot.windows
+    let apps = snapshot.apps
+    for window, data in window_registry {
+        if window in windows {
+            let previous = windows[window]
+            data.pending_view = previous.pending_view
+            data.dirty = previous.dirty
+        } else {
+            // Release the public name immediately; retain this allocation for cleanup.
+            data.reload_rejected = true
+            rejected_reload_windows.push(window)
+        }
+    }
+    for app, data in app_registry {
+        if app in apps {
+            let previous = apps[app]
+            data.queued = previous.queued
+            data.commands = previous.commands
+        } else {
+            data.queued = []
+            data.commands = []
+            rejected_reload_apps.push(app)
+        }
+    }
+    application_keys = snapshot.keys
+    for app in rejected_reload_apps { app_registry[app].tasks.close() }
+    return nil
+}
+
+fn retire_entry_windows() {
+    let pending_windows: [Window] = []
+    for window in rejected_reload_windows {
+        if window in window_registry {
+            let data = window_registry[window]
+            if desktop_close(data.app, data.id) { pending_windows.push(window) }
+        }
+    }
+    rejected_reload_windows = pending_windows
+    let pending_apps: [App] = []
+    for app in rejected_reload_apps {
+        let data = app_registry[app]
+        var windows_pending = false
+        for window in pending_windows {
+            if window in window_registry && window_registry[window].app == app { windows_pending = true }
+        }
+        if data.tasks.poll().pending || windows_pending { pending_apps.push(app) }
+        else { app_registry.remove(app) }
+    }
+    rejected_reload_apps = pending_apps
+}
+
+fn desktop_advance(app: App) -> DesktopTurn {
+    let owner = app_data(app)
+    if owner.updates && poll_updates(snapshot_entry_updates, finish_entry_updates) {
+        // A module swap can change a retained function without replacing its view.
+        // Exact replay callbacks admit candidates; the batch result only invalidates.
+        for window, _ in window_registry { if window.is_open() { window.notify() } }
+    }
+    retire_entry_windows()
+    let polls: [DesktopPoll] = []
+    for window in owner.windows {
+        if !(window in window_registry) { continue }
+        let data = window_registry[window]
+        if data.closed { continue }
+        let turn = data.tasks.poll()
+        polls.push(DesktopPoll.new(window: data.id, changed: data.dirty || turn.resumed > 0, pending: turn.pending, next_ms: turn.next_ms ?? 16.0))
+        data.dirty = false
+    }
+    retire_frames(owner)
+    let queued = owner.queued
+    let commands = owner.commands
+    owner.queued = []
+    owner.commands = []
+    return DesktopTurn.new(windows: queued, commands: commands, polls: polls)
+}
+
+struct ApplicationDrain { failed: bool = false, failure: Any = nil }
+
+fn drain_application(app: App, owner: AppData) -> ApplicationDrain {
+    let outcome = ApplicationDrain.new()
+    // The platform may return before its next asynchronous close callback.
+    // The application root also owns detached/retired frame cleanup.
+    owner.tasks.close()
+    var pending = true
+    while pending {
+        pending = false
+        for window in owner.windows {
+            if window in window_registry {
+                try {
+                    pending = desktop_close(app, window_registry[window].id) || pending
+                } catch failure {
+                    if !outcome.failed { outcome.failed = true; outcome.failure = failure }
+                    pending = true
+                }
+            }
+        }
+        try {
+            pending = owner.tasks.poll().pending || pending
+        } catch failure {
+            if !outcome.failed { outcome.failed = true; outcome.failure = failure }
+            pending = true
+        }
+        try {
+            retire_frames(owner)
+        } catch failure {
+            if !outcome.failed { outcome.failed = true; outcome.failure = failure }
+            pending = true
+        }
+        try {
+            retire_entry_windows()
+            pending = rejected_reload_windows.len() > 0 || rejected_reload_apps.len() > 0 || pending
+        } catch failure {
+            if !outcome.failed { outcome.failed = true; outcome.failure = failure }
+            pending = true
+        }
+        if pending { sleep(1) }
+    }
+    return outcome
+}
+
+fn run_application(app: App) {
+    let owner = app_data(app)
+    if owner.running { return }
+    assert(active_app == nil, "only one native application may run at a time")
+    assert(owner.windows.len() > 0, "open at least one window before App.run()")
+    owner.running = true
+    active_app = app
+    let initial = owner.queued
+    owner.queued = []
+    let updates = begin_updates()
+    owner.updates = updates
+    var failed = false
+    var failure: Any = nil
+    try {
+        native_desktop(initial, updates, |id: int| desktop_render(app, id), |events: [DesktopEvent]| desktop_dispatch(app, events), || desktop_advance(app), |id: int| desktop_close(app, id))
+    } catch e {
+        failed = true
+        failure = e
+    }
+    let drained = drain_application(app, owner)
+    if !failed && drained.failed { failed = true; failure = drained.failure }
+    end_updates()
+    owner.running = false
+    active_app = nil
+    app_registry.remove(app)
+    if failed { error(failure, 0) }
+}
+
+pub fn TextInput(value: str = "", on_change: (fn(str) -> Any)? = nil, on_submit: (fn(str) -> Any)? = nil,
+    placeholder: str = "", id: str = "", disabled: bool = false, read_only: bool = false, style: Style = Style.new(padding: 8.0, background: 0x27272a, radius: 6.0)) -> Node {
+    return Node.new(kind: "input", key: id, text: value, on_change: on_change, on_submit: on_submit, placeholder: placeholder, disabled: disabled, read_only: read_only, style: style)
+}
+pub fn TextArea(value: str = "", on_change: (fn(str) -> Any)? = nil, on_submit: (fn(str) -> Any)? = nil,
+    placeholder: str = "", id: str = "", disabled: bool = false, read_only: bool = false, submit_on_enter: bool = false, style: Style = Style.new(padding: 8.0, background: 0x27272a, radius: 6.0, height: 160.0)) -> Node {
+    return Node.new(kind: "input", key: id, text: value, on_change: on_change, on_submit: on_submit, placeholder: placeholder, disabled: disabled, read_only: read_only, multiline: true, submit_on_enter: submit_on_enter, style: style)
+}
+pub fn Checkbox(value: bool, on_change: fn(bool) -> Any, label: str = "", id: str = "", disabled: bool = false, style: Style = Style.new(gap: 8.0)) -> Node {
+    return Node.new(kind: "checkbox", key: id, text: label, checked: value, on_toggle: on_change, disabled: disabled, style: style)
+}
+pub fn Switch(value: bool, on_change: fn(bool) -> Any, label: str = "", id: str = "", disabled: bool = false, style: Style = Style.new(gap: 8.0)) -> Node {
+    return Node.new(kind: "switch", key: id, text: label, checked: value, on_toggle: on_change, disabled: disabled, style: style)
+}
+pub fn Scroll(style: Style = Style.new(), id: str = "", children: Any = nil) -> Node {
+    return Node.new(kind: "scroll", key: id, style: style, children: children_of(children))
+}
+pub fn Spacer() -> Node { return Node.new(kind: "spacer") }
+pub fn Separator() -> Node { return Node.new(kind: "separator") }
+pub fn Code(value: str, language: str = "", id: str = "", style: Style = Style.new(padding: 12.0, background: 0x09090b, radius: 6.0)) -> Node {
+    return Node.new(kind: "code", key: id, text: value, language: language, style: style)
+}
+
+/// Owned rich-text runs; links dispatch to the application instead of opening URLs.
+pub struct TextSpan {
+    text: str, bold: bool = false, italic: bool = false, underline: bool = false,
+    code: bool = false, color: int = -1, link: str = "",
+}
+/// Canvas coordinates are logical pixels relative to its own bounds.
+pub struct CanvasPrimitive {
+    kind: str, x: float = 0.0, y: float = 0.0, width: float = 0.0, height: float = 0.0,
+    radius: float = 0.0, color: int = -1, stroke: int = -1, stroke_width: float = 1.0,
+    text: str = "", font_size: float = 16.0,
+}
+pub fn RichText(runs: [TextSpan], on_link: (fn(str) -> Any)? = nil, id: str = "", style: Style = Style.new()) -> Node {
+    return Node.new(kind: "rich_text", key: id, runs: runs, on_link: on_link, style: style)
+}
+pub fn Markdown(value: str, on_link: (fn(str) -> Any)? = nil, id: str = "", style: Style = Style.new(gap: 8.0)) -> Node {
+    return Node.new(kind: "markdown", key: id, text: value, on_link: on_link, style: style)
+}
+pub fn Image(source: str, id: str = "", style: Style = Style.new()) -> Node {
+    return Node.new(kind: "image", key: id, source: source, style: style)
+}
+pub fn Icon(source: str, id: str = "", style: Style = Style.new(width: 20.0, height: 20.0)) -> Node {
+    return Node.new(kind: "icon", key: id, source: source, style: style)
+}
+pub fn Canvas(primitives: [CanvasPrimitive], id: str = "", style: Style = Style.new(width: 320.0, height: 180.0)) -> Node {
+    return Node.new(kind: "canvas", key: id, primitives: primitives, style: style)
+}
+pub fn Split(ratio: float = 0.5, on_resize: (fn(float) -> Any)? = nil, vertical: bool = false, id: str = "", style: Style = Style.new(), children: Any = nil) -> Node {
+    let parts = children_of(children)
+    assert(parts.len() == 2, "Split requires exactly two panels")
+    assert(ratio > 0.0 && ratio < 1.0, "Split ratio must be between zero and one")
+    return Node.new(kind: "split", key: id, ratio: ratio, on_resize: on_resize, vertical: vertical, style: style, children: parts)
+}
+pub fn Progress(value: float, id: str = "", style: Style = Style.new(height: 4.0, background: 0x3f3f46, color: 0x60a5fa, radius: 2.0)) -> Node {
+    assert(value >= 0.0 && value <= 1.0, "Progress value must be between zero and one")
+    return Node.new(kind: "progress", key: id, ratio: value, style: style)
+}
+pub fn Badge(value: str, id: str = "", style: Style = Style.new(padding: 4.0, background: 0x3f3f46, radius: 4.0, font_size: 12.0, shrink: 0.0)) -> Node {
+    return Node.new(kind: "badge", key: id, text: value, style: style)
+}
+
+pub struct Palette {
+    background: int = 0x18181b, surface: int = 0x27272a, elevated: int = 0x3f3f46,
+    text: int = 0xf4f4f5, muted: int = 0xa1a1aa, accent: int = 0x60a5fa,
+    success: int = 0x4ade80, warning: int = 0xfbbf24, danger: int = 0xf87171,
+}
+pub fn light_palette() -> Palette {
+    return Palette.new(background: 0xfafafa, surface: 0xf4f4f5, elevated: 0xe4e4e7, text: 0x18181b, muted: 0x52525b, accent: 0x2563eb, success: 0x15803d, warning: 0xa16207, danger: 0xdc2626)
+}
+pub struct Tab { id: str, label: str, closable: bool = false, disabled: bool = false }
+pub fn Tabs(items: [Tab], selected: str, on_select: fn(str) -> Any, on_close: (fn(str) -> Any)? = nil, id: str = "", palette: Palette = Palette.new()) -> Node {
+    let nodes: [Node] = []
+    for item in items {
+        let choose = || on_select(item.id)
+        let tab_children: [Node] = [Button(choose, id: "select", disabled: item.disabled,
+            style: Style.new(padding: 10.0, background: if item.id == selected { palette.elevated } else { palette.surface }, color: palette.text), children: [Text(item.label)])]
+        if item.closable && on_close != nil {
+            tab_children.push(Button(|| on_close(item.id), id: "close", disabled: item.disabled, tooltip: "Close {item.label}",
+                style: Style.new(padding: 6.0, background: palette.surface, color: palette.muted), children: [Text("×")]))
+        }
+        nodes.push(Row(id: item.id, style: Style.new(gap: 0.0), children: tab_children))
+    }
+    return Row(id: id, style: Style.new(gap: 2.0), children: nodes)
+}
+pub struct SelectOption { value: str, label: str, disabled: bool = false }
+pub fn Select(items: [SelectOption], selected: str, on_change: fn(str) -> Any, id: str = "", palette: Palette = Palette.new()) -> Node {
+    let nodes: [Node] = []
+    for item in items {
+        nodes.push(Button(|| on_change(item.value), id: item.value, disabled: item.disabled,
+            style: Style.new(padding: 8.0, background: if item.value == selected { palette.elevated } else { palette.surface }, color: palette.text), children: [Text(item.label)]))
+    }
+    return Column(id: id, style: Style.new(gap: 2.0), children: nodes)
+}
+/// Keyed rows preserve native focus and local component identity when reordered.
+pub fn List<T>(items: [T], key: fn(T) -> str, render: fn(T) -> Node, id: str, style: Style = Style.new()) -> Node {
+    assert(id != "", "List requires a stable nonempty id")
+    let keys: [str] = []
+    for item in items {
+        let identity = key(item)
+        assert(identity != "", "List requires stable nonempty row keys")
+        assert(!(identity in keys), "duplicate List row key '{identity}'")
+        keys.push(identity)
+    }
+    return Component(id, || {
+        let nodes: [Node] = []
+        var index = 0
+        for item in items {
+            let identity = keys[index]
+            nodes.push(Component(identity, || render(item)))
+            index += 1
+        }
+        return Column(style: style, children: nodes)
+    })
+}
+pub struct TreeItem { id: str, label: str, directory: bool = false, children: [TreeItem] = [] }
+pub fn Tree(items: [TreeItem], selected: str, expanded: #{str: bool}, on_select: fn(str) -> Any, on_expand: fn(str) -> Any, id: str = "", palette: Palette = Palette.new()) -> Node {
+    let nodes: [Node] = []
+    for item in items {
+        let open = item.id in expanded && expanded[item.id]
+        let marker = if item.directory { if open { "▾ " } else { "▸ " } } else { "  " }
+        nodes.push(Button(|| { if item.directory { on_expand(item.id) } else { on_select(item.id) } }, id: "{item.id}/row",
+            style: Style.new(padding: 6.0, background: if item.id == selected { palette.elevated } else { palette.surface }, color: palette.text), children: [Text("{marker}{item.label}")]))
+        if item.directory && open {
+            nodes.push(Column(id: "{item.id}/children", style: Style.new(padding: 12.0, gap: 2.0),
+                children: [Tree(item.children, selected, expanded, on_select, on_expand, palette: palette)]))
+        }
+    }
+    return Column(id: id, style: Style.new(gap: 2.0), children: nodes)
+}
+pub struct MenuItem { id: str, label: str, shortcut: str = "", disabled: bool = false }
+pub fn Menu(items: [MenuItem], on_select: fn(str) -> Any, id: str = "", palette: Palette = Palette.new()) -> Node {
+    let nodes: [Node] = []
+    for item in items {
+        nodes.push(Button(|| on_select(item.id), id: item.id, disabled: item.disabled,
+            style: Style.new(padding: 8.0, background: palette.surface, color: palette.text),
+            children: [Row(children: [Text(item.label), Spacer(), Text(item.shortcut, style: Style.new(color: palette.muted, font_size: 12.0))])]))
+    }
+    return Column(id: id, style: Style.new(padding: 4.0, gap: 2.0, background: palette.surface, radius: 8.0), children: nodes)
+}
+pub fn Dialog(open: bool, title: str, on_dismiss: fn() -> Any, id: str = "", palette: Palette = Palette.new(), children: Any = nil) -> Node {
+    if !open { return Fragment() }
+    let body = children_of(children)
+    let content = Column(style: Style.new(padding: 24.0, gap: 16.0, background: palette.surface, color: palette.text, radius: 12.0, width: 520.0), children: [
+        Row(children: [Text(title, style: Style.new(font_size: 20.0)), Spacer(), Button(on_dismiss, id: "dismiss", tooltip: "Close dialog", children: [Text("×")])]),
+        Fragment(body),
+    ])
+    return Node.new(kind: "modal", key: id, on_dismiss: on_dismiss, children: [content])
+}

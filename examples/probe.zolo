@@ -1,0 +1,17 @@
+use gpui::{probe, Node, Column, Text, Button}
+
+var count = 0
+fn Counter() -> Node {
+    <Column>
+        <Text value={"Contador: {count}"} />
+        <Button key="increment" on_click={|| { count += 1 }}>Aumentar</Button>
+        { for label in ["a", "b"] { <Text value={label} /> } }
+    </Column>
+}
+
+let tree = probe(Counter, event: 1)
+assert_eq(count, 1)
+assert_eq(tree[0].children.len(), 4)
+assert_eq(tree[0].children[0].text, "Contador: 1")
+assert_eq(tree[0].children[1].key, "increment")
+print("GPUI bridge: render, events and Verniz children passed")

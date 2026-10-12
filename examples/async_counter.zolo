@@ -1,0 +1,24 @@
+use gpui::{run, state, Node, Column, Row, Text, Button, Style}
+
+let count = state("async-count", 0)
+let status = state("async-status", "Pronto")
+
+async fn load() {
+    status.value = "Carregando... pode continuar clicando"
+    sleep(750)
+    count.value += 10
+    status.value = "Concluído"
+}
+
+fn AsyncCounter() -> Node {
+    <Column style={Style.new(padding: 24.0, gap: 16.0)}>
+        <Text value={"Contador: {count.value}"} />
+        <Text value={status.value} />
+        <Row>
+            <Button key="load" on_click={load}>Carregar +10</Button>
+            <Button key="increment" on_click={|| { count.value += 1 }}>Aumentar +1</Button>
+        </Row>
+    </Column>
+}
+
+run(AsyncCounter, title: "Zolo GPUI — tarefas assíncronas")

@@ -1,0 +1,7 @@
+[project]
+name = "zolo-gpui-examples"
+version = "0.1.0"
+entry = "counter.zolo"
+
+[dependencies]
+gpui = { path = ".." }

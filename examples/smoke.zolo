@@ -1,0 +1,15 @@
+use gpui::{smoke, Node, Column, Text, Button, Style}
+
+var count = 0
+fn Counter() -> Node {
+    <Column style={Style.new(padding: 20.0)}>
+        <Button key="increment" on_click={|| { count += 1 }} style={Style.new(width: 200.0, height: 60.0, background: 0x2563eb)}>
+            Aumentar
+        </Button>
+        <Text value={"Contador: {count}"} />
+    </Column>
+}
+
+smoke(Counter)
+assert_eq(count, 1)
+print("GPUI window: native click updated Zolo state")

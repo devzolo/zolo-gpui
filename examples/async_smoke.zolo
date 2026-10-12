@@ -1,0 +1,50 @@
+use gpui::{smoke, Node, Column, Text, Button, Style}
+use std::async::CancelKind
+
+var completed = 0
+var cleaned = 0
+var late_delivery = 0
+var shutdown = false
+var renders_while_pending = 0
+var renders_after_completion = 0
+var loading = false
+
+async fn finish_soon() {
+    sleep(100)
+    completed += 1
+    loading = false
+}
+
+async fn finish_late() {
+    defer {
+        cleaned += 1
+        let reason = ctx.cancel_reason()
+        if reason != nil { shutdown = reason.kind == CancelKind.Shutdown }
+    }
+    sleep(5000)
+    late_delivery += 1
+}
+
+fn start() {
+    loading = true
+    finish_soon()
+    finish_late()
+}
+
+fn AsyncSmoke() -> Node {
+    if loading { renders_while_pending += 1 }
+    if completed > 0 { renders_after_completion += 1 }
+    <Column style={Style.new(padding: 12.0)}>
+        <Button key="start" on_click={start}>Start async work</Button>
+        <Text value={"Completed: {completed}"} />
+    </Column>
+}
+
+smoke(AsyncSmoke, x: 40.0, y: 40.0)
+assert_eq(completed, 1)
+assert_eq(cleaned, 1)
+assert_eq(late_delivery, 0)
+assert_eq(shutdown, true)
+assert_eq(renders_while_pending > 0, true)
+assert_eq(renders_after_completion > 0, true)
+print("async completion, responsive rendering, Shutdown cancellation and cleanup: ok")

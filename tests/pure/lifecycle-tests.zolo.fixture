@@ -1,0 +1,438 @@
+// Pure controller gates; native rendering and schema gates run separately.
+fn rejects(body: fn() -> Any) -> bool {
+    try { body() } catch _ { return true }
+    return false
+}
+assert(rejects(|| App.new().quit()))
+assert(rejects(|| Window.new().notify()))
+assert(rejects(|| Context.new().window()))
+assert(rejects(|| State.new(value: 7).value))
+let typed_integer: State<int> = state("schema-check", 1)
+assert(rejects(|| state("schema-check", "changed")), "schema changes must reject before returning an old cell")
+struct NestedModel<T> { items: [T] }
+let nested_integer = state("schema-nested", NestedModel.new(items: [1, 2]))
+assert(rejects(|| state("schema-nested", NestedModel.new(items: ["x"]))), "nested generic schemas must remain distinct")
+let nullable: State<str?> = state("schema-nullable", nil)
+nullable.value = "ready"
+let same_nullable: State<str?> = state("schema-nullable", nil)
+assert(same_nullable.value == "ready", "nil initialization must retain the annotated optional schema")
+let entity_cell = entity("entity-check", 4)
+entity_cell.update(|number| number + 1)
+assert(entity_cell.read() == 5)
+
+// These gates use the real library builders, encoding, Handlers records and
+// desktop_dispatch. Only the native renderer is stubbed by the pure fixture.
+// Distinct payloads make an implicit receiver or a swapped event slot visible.
+let event_app = application("event-parameter-test")
+var event_change = ""
+var event_submit = ""
+var event_toggle = true
+var event_resize = 0.0
+var event_key_value = ""
+var event_link = ""
+var event_action = ""
+var event_dismissed = false
+var event_clicks = 0
+var event_order: [str] = []
+let event_window = event_app.window("main", || Column(id: "events", on_key: |value: str| {
+    assert(value == "ctrl-alt-shift-k", "key callback must receive the authored chord without an implicit receiver")
+    event_key_value = value
+    event_order.push("key")
+}, children: [
+    TextInput(id: "text", on_change: |value: str| {
+        assert(value == "change🙂\nΩ", "change callback must receive event.text, never a Handlers object")
+        event_change = value
+        event_order.push("change")
+    }, on_submit: |value: str| {
+        assert(value == "submit café 🚀", "submit callback must receive its own distinctive text")
+        event_submit = value
+        event_order.push("submit")
+    }),
+    Checkbox(true, |value: bool| {
+        assert(value == false, "toggle callback must receive event.checked even when it is false")
+        event_toggle = value
+        event_order.push("toggle")
+    }, id: "toggle"),
+    Split(id: "resize", on_resize: |value: float| {
+        assert(value == 0.375, "resize callback must receive the scalar ratio")
+        event_resize = value
+        event_order.push("resize")
+    }, children: [Text("left"), Text("right")]),
+    Markdown("[link](zolo://events/link)", id: "link", on_link: |value: str| {
+        assert(value == "zolo://events/link?value=Ω", "link callback must receive the selected target")
+        event_link = value
+        event_order.push("link")
+    }),
+    Node.new(kind: "button", key: "action", action: "save-selection", on_action: |value: str| {
+        assert(value == "save-selection:β", "action callback must receive the action payload")
+        event_action = value
+        event_order.push("action")
+    }),
+    Dialog(true, "Event dialog", || { event_dismissed = true; event_order.push("dismiss") }, id: "dismiss"),
+    Button(|| { event_clicks += 1; event_order.push("click") }, id: "click"),
+]))
+let event_id = window_data(event_window).id
+let event_tree = desktop_render(event_app, event_id)
+desktop_dispatch(event_app, [
+    DesktopEvent.new(window: event_id, node: event_tree[0].children[0].key, kind: "change", text: "change🙂\nΩ", number: 0.875, checked: true, key: "wrong-change-slot"),
+    DesktopEvent.new(window: event_id, node: event_tree[0].children[0].key, kind: "submit", text: "submit café 🚀", number: 0.125, checked: false, key: "wrong-submit-slot"),
+    DesktopEvent.new(window: event_id, node: event_tree[0].children[1].key, kind: "change", text: "wrong-toggle-slot", number: 0.75, checked: false, key: "wrong-toggle-key"),
+    DesktopEvent.new(window: event_id, node: event_tree[0].children[2].key, kind: "resize", text: "wrong-resize-slot", number: 0.375, checked: true, key: "wrong-resize-key"),
+    DesktopEvent.new(window: event_id, node: event_tree[0].key, kind: "key", text: "wrong-key-slot", number: 0.25, checked: false, key: "ctrl-alt-shift-k"),
+    DesktopEvent.new(window: event_id, node: event_tree[0].children[3].key, kind: "link", text: "zolo://events/link?value=Ω", number: 0.625, checked: true, key: "wrong-link-slot"),
+    DesktopEvent.new(window: event_id, node: event_tree[0].children[4].key, kind: "action", text: "save-selection:β", number: 0.5, checked: false, key: "wrong-action-slot"),
+    DesktopEvent.new(window: event_id, node: event_tree[0].children[5].key, kind: "dismiss", text: "wrong-dismiss-slot", number: 0.875, checked: true, key: "wrong-dismiss-key"),
+    DesktopEvent.new(window: event_id, node: event_tree[0].children[6].key, kind: "click", text: "wrong-click-slot", number: 0.125, checked: false, key: "wrong-click-key"),
+])
+assert(event_change == "change🙂\nΩ" && event_submit == "submit café 🚀" && event_toggle == false)
+assert(event_resize == 0.375 && event_key_value == "ctrl-alt-shift-k")
+assert(event_link == "zolo://events/link?value=Ω" && event_action == "save-selection:β")
+assert(event_dismissed && event_clicks == 1 && event_order.len() == 9)
+assert(event_order[0] == "change" && event_order[1] == "submit" && event_order[2] == "toggle" && event_order[3] == "resize")
+assert(event_order[4] == "key" && event_order[5] == "link" && event_order[6] == "action" && event_order[7] == "dismiss" && event_order[8] == "click",
+    "each encoded event must invoke only its corresponding callback once and in dispatch order")
+while desktop_close(event_app, event_id) { sleep(1) }
+print("desktop event parameter oracles passed")
+
+let test_app = application("controller-test")
+let model = state("controller-test:model", 0)
+var renders = 0
+var notifications = 0
+var leaf_context: Context? = nil
+fn TestLeaf() -> Node {
+    renders += 1
+    leaf_context = context()
+    model.subscribe(|| { notifications += 1 })
+    return Button(|| { model.value += 1 }, id: "increment", children: [Text(model.value)])
+}
+fn TestOuter() -> Node { return Component("leaf", TestLeaf) }
+fn TestRoot() -> Node { return Component("outer", TestOuter) }
+let first = test_app.window("first", TestRoot)
+let second = test_app.window("second", || Text("independent"))
+let first_id = window_data(first).id
+let second_id = window_data(second).id
+var first_listener = 0
+var second_listener = 0
+let shared = state("two-listeners", 0)
+let listener_a = first.context().run(|| shared.subscribe(|| { first_listener += 1 }))
+let listener_b = first.context().run(|| shared.subscribe(|| { second_listener += 1 }))
+listener_a.dispose()
+shared.value = 1
+assert(!listener_a.is_active() && listener_b.is_active())
+assert(first_listener == 0 && second_listener == 1, "disposal must preserve other authentic subscriptions")
+let initial_tree = desktop_render(test_app, first_id)
+assert(renders == 1)
+desktop_render(test_app, first_id)
+assert(renders == 1, "unchanged nested component should be cached")
+model.value = 2
+assert(window_data(first).dirty)
+desktop_render(test_app, first_id)
+assert(renders == 2, "leaf invalidation must reach its cached parent")
+assert(state_owners[model].subscriptions.len() == 1, "rerender must dispose old subscriptions")
+let encoded_button = initial_tree[0].children[0].children[0]
+desktop_dispatch(test_app, [DesktopEvent.new(window: first_id, node: encoded_button.key, kind: "click", text: "", number: 0.0, checked: false, key: "")])
+assert(model.value == 3)
+desktop_advance(test_app)
+assert(notifications == 2)
+var external_label = "old"
+var external_context: Context? = nil
+fn ExternalLeaf() -> Node { external_context = context(); return Text(external_label) }
+let notify_window = test_app.window("notify", || Component("external", ExternalLeaf))
+let notify_id = window_data(notify_window).id
+desktop_render(test_app, notify_id)
+external_label = "new"
+let notify_context = external_context ?? panic("missing component context")
+notify_context.notify()
+let notified = desktop_render(test_app, notify_id)
+assert(notified[0].children[0].text == "new", "component notify must invalidate its cached view")
+
+app_data(test_app).updates = true
+let old_component_context = leaf_context ?? panic("missing old component")
+var rejected_context: Context? = nil
+var rejected_task_ran = false
+test_app.window("first", || {
+    rejected_context = context()
+    context().run(|| spawn { rejected_task_ran = true })
+    assert(false, "bad replacement")
+    return Text("unreachable")
+})
+let retained = desktop_render(test_app, first_id)
+assert(retained.len() == 1 && first.is_open() && second.is_open())
+assert(first.last_error().contains("bad replacement"))
+assert(!context_registry[old_component_context].tasks.is_closed(), "failed replacement must preserve old component tasks")
+assert(!rejected_context.is_active(), "a rejected render must revoke its ambient frame context")
+desktop_advance(test_app)
+assert(!rejected_task_ran, "a rejected render must cancel tasks before they start")
+window_data(first).dirty = false
+model.value = 9
+assert(window_data(first).dirty, "failed replacement must preserve the last valid view's state dependencies")
+desktop_render(test_app, first_id)
+injected_native_validation_error = "invalid native frame"
+test_app.window("first", || Text("invalid candidate"))
+desktop_render(test_app, first_id)
+assert(first.last_error().contains("invalid native frame"))
+assert(old_component_context.is_active(), "native validation must finish before replacement commit")
+injected_native_validation_error = ""
+test_app.window("first", || Text("replacement accepted"))
+let replaced = desktop_render(test_app, first_id)
+assert(replaced[0].text == "replacement accepted")
+assert(rejects(|| old_component_context.run(|| 1)), "successful replacement revokes old component contexts")
+while desktop_close(test_app, notify_id) { sleep(1) }
+
+var cleaned_first = false
+var completed_second = false
+first.context().run(|| { spawn { defer { cleaned_first = true }; sleep(10000) } })
+second.context().run(|| { spawn { sleep(1); completed_second = true } })
+desktop_advance(test_app)
+while desktop_close(test_app, first_id) { sleep(1) }
+assert(cleaned_first)
+assert(!first.is_open() && second.is_open())
+assert(rejects(|| leaf_context.run(|| 1)), "unmounted contexts must be revoked")
+assert(state_owners[model].subscriptions.len() == 0)
+var attempts = 0
+while !completed_second && attempts < 100 {
+    desktop_advance(test_app)
+    sleep(1)
+    attempts += 1
+}
+assert(completed_second, "closing one window must retain the other window's tasks")
+while desktop_close(test_app, second_id) { sleep(1) }
+assert(!second.is_open())
+
+let dynamic_app = application("dynamic-window-test")
+var dynamic_second: Window? = nil
+var dynamic_finished = false
+let dynamic_first = dynamic_app.window("first", || Button(|| {
+    dynamic_second = dynamic_app.window("second", || Text("independent child window"))
+    dynamic_second.context().run(|| spawn { sleep(5); dynamic_finished = true })
+}, id: "open"))
+let dynamic_id = window_data(dynamic_first).id
+let dynamic_tree = desktop_render(dynamic_app, dynamic_id)
+desktop_dispatch(dynamic_app, [DesktopEvent.new(window: dynamic_id, node: dynamic_tree[0].key, kind: "click", text: "", number: 0.0, checked: false, key: "")])
+while desktop_close(dynamic_app, dynamic_id) { sleep(1) }
+var dynamic_turns = 0
+while !dynamic_finished && dynamic_turns < 100 { desktop_advance(dynamic_app); sleep(1); dynamic_turns += 1 }
+assert(dynamic_finished && dynamic_second.is_open(), "dynamically opened windows must outlive the opening event's window")
+let dynamic_retained = dynamic_second ?? panic("dynamic window missing")
+let dynamic_retained_id = window_data(dynamic_retained).id
+while desktop_close(dynamic_app, dynamic_retained_id) { sleep(1) }
+
+let scope_one = application("scope-one")
+let scope_two = application("scope-two")
+var scoped_one: State<int>? = nil
+var scoped_two: State<int>? = nil
+let scope_window_one = scope_one.window("main", || { scoped_one = state("local", 1); return Text(scoped_one.value) })
+let scope_window_two = scope_two.window("main", || { scoped_two = state("local", 2); return Text(scoped_two.value) })
+desktop_render(scope_one, window_data(scope_window_one).id)
+desktop_render(scope_two, window_data(scope_window_two).id)
+assert(scoped_one.value == 1 && scoped_two.value == 2, "window-local state must include the application identity")
+while desktop_close(scope_one, window_data(scope_window_one).id) { sleep(1) }
+while desktop_close(scope_two, window_data(scope_window_two).id) { sleep(1) }
+
+let path_scope_one = application("path/scope")
+let path_scope_two = application("path")
+var path_cell_one: State<int>? = nil
+var path_cell_two: State<int>? = nil
+let path_window_one = path_scope_one.window("main", || { path_cell_one = state("local", 11); return Text(path_cell_one.value) })
+let path_window_two = path_scope_two.window("scope/main", || { path_cell_two = state("local", 22); return Text(path_cell_two.value) })
+desktop_render(path_scope_one, window_data(path_window_one).id)
+desktop_render(path_scope_two, window_data(path_window_two).id)
+assert(path_cell_one.value == 11 && path_cell_two.value == 22, "authored slashes must never merge window state identities")
+while desktop_close(path_scope_one, window_data(path_window_one).id) { sleep(1) }
+while desktop_close(path_scope_two, window_data(path_window_two).id) { sleep(1) }
+
+let path_components = application("path-component-test")
+var flat_cell: State<int>? = nil
+var nested_cell: State<int>? = nil
+let path_component_window = path_components.window("main", || Row(children: [
+    Component("parent/leaf", || { flat_cell = state("local", 31); return Text(flat_cell.value) }),
+    Component("parent", || Component("leaf", || { nested_cell = state("local", 42); return Text(nested_cell.value) })),
+    Text("positional"), Text("numeric authored key", id: "2"), Text("reserved key", id: "~2"),
+]))
+let path_component_tree = desktop_render(path_components, window_data(path_component_window).id)
+assert(flat_cell.value == 31 && nested_cell.value == 42, "a path-shaped authored component must not alias a nested component")
+assert(window_data(path_component_window).components.len() == 3)
+assert(path_component_tree[0].children[2].key.ends_with("/~2"))
+assert(path_component_tree[0].children[3].key.ends_with("/2"))
+assert(path_component_tree[0].children[4].key.ends_with("/%7E2"))
+while desktop_close(path_components, window_data(path_component_window).id) { sleep(1) }
+
+let admission_app = application("frame-admission-test")
+app_data(admission_app).updates = true
+var admitted_original: State<int>? = nil
+var rejected_root_cell: State<int>? = nil
+var rejected_nested_cell: State<int>? = nil
+var rejected_started = false
+var rejected_drained = false
+var rejected_release_cleanup = false
+var rejected_cleanup_value = 0
+var unrelated_frame_task_started = false
+var unrelated_frame_task_cleaned = false
+let admission_window = admission_app.window("main", || {
+    admitted_original = state("committed", 17)
+    return Text(admitted_original.value)
+})
+let admission_id = window_data(admission_window).id
+desktop_render(admission_app, admission_id)
+let prior_state_count = states.len()
+let prior_owner_count = state_owners.len()
+admission_window.context().run(|| spawn {
+    defer { unrelated_frame_task_cleaned = true }
+    unrelated_frame_task_started = true
+    sleep(10000)
+})
+injected_native_validation_error = "reject newly admitted state"
+injected_native_validation_hook = || {
+    // The candidate view's TaskGroup.run has returned by native validation.
+    // Polling here starts its producer without nesting a foreground poll.
+    context_registry[context()].tasks.poll()
+    return
+}
+admission_app.window("main", || {
+    let candidate_cell: State<int> = state("brand-new", 23)
+    rejected_root_cell = candidate_cell
+    Component("candidate", || {
+        rejected_nested_cell = state("brand-new", 29)
+        return Text(rejected_nested_cell.value)
+    })
+    context().run(|| spawn {
+        defer {
+            sleep(2)
+            while !rejected_release_cleanup { sleep(1) }
+            assert(candidate_cell.value == 23, "awaited cleanup must still authenticate its rejected cell")
+            candidate_cell.value = 24
+            rejected_cleanup_value = candidate_cell.value
+            rejected_drained = true
+        }
+        rejected_started = true
+        sleep(10000)
+    })
+    return Text(rejected_root_cell.value)
+})
+desktop_render(admission_app, admission_id)
+injected_native_validation_hook = nil
+injected_native_validation_error = ""
+assert(rejected_started && !rejected_drained)
+assert(states.len() == prior_state_count && state_owners.len() == prior_owner_count + 2,
+    "rejected names must roll back immediately, while new cells await their own frame's physical cleanup")
+let revoked_root: State<int> = rejected_root_cell ?? panic("missing rejected root cell")
+let revoked_nested: State<int> = rejected_nested_cell ?? panic("missing rejected nested cell")
+assert(revoked_root.value == 23 && revoked_nested.value == 29)
+assert(state_owners[revoked_root].windows.len() == 0 && state_owners[revoked_root].components.len() == 0 && state_owners[revoked_root].subscriptions.len() == 0,
+    "retired cells must detach from old and replacement view dependencies")
+var corrected_root_cell: State<str>? = nil
+var corrected_nested_cell: State<str>? = nil
+admission_app.window("main", || {
+    corrected_root_cell = state("brand-new", "corrected root")
+    return Row(children: [Text(corrected_root_cell.value), Component("candidate", || {
+        corrected_nested_cell = state("brand-new", "corrected nested")
+        return Text(corrected_nested_cell.value)
+    })])
+})
+desktop_render(admission_app, admission_id)
+assert(admission_window.last_error() == "" && corrected_root_cell.value == "corrected root" && corrected_nested_cell.value == "corrected nested",
+    "a corrected replacement may change the schema of state admitted only by a failed candidate")
+assert(!rejected_drained && revoked_root.value == 23,
+    "the corrected schema must be admitted before the rejected frame finishes cleanup")
+desktop_advance(admission_app)
+assert(unrelated_frame_task_started && !unrelated_frame_task_cleaned)
+assert(app_data(admission_app).retired_frames.len() == 1 && revoked_root.value == 23)
+window_data(admission_window).dirty = false
+rejected_release_cleanup = true
+var admission_turns = 0
+while !rejected_drained && admission_turns < 100 { desktop_advance(admission_app); sleep(1); admission_turns += 1 }
+assert(rejected_drained && rejected_cleanup_value == 24, "failed candidate producers must finish awaited cell-aware cleanup")
+assert(app_data(admission_app).retired_frames.len() == 0 && !unrelated_frame_task_cleaned,
+    "retirement must finish independently of unrelated still-running window tasks")
+assert(rejects(|| revoked_root.value) && rejects(|| revoked_nested.value), "rejected cells must revoke after their frame physically drains")
+assert(!window_data(admission_window).dirty, "mutating a retired cell during cleanup must not invalidate the accepted view")
+assert(corrected_root_cell.value == "corrected root" && corrected_nested_cell.value == "corrected nested")
+let corrected_state_count = states.len()
+admission_app.window("main", || {
+    state("another-uncommitted", true)
+    state("committed", "wrong schema")
+    return Text("unreachable")
+})
+desktop_render(admission_app, admission_id)
+assert(admission_window.last_error().contains("changed type") && admitted_original.value == 17,
+    "rollback must retain schema guards for previously committed state")
+assert(states.len() == corrected_state_count, "language-side rejection must also roll back new admissions")
+assert(corrected_root_cell.value == "corrected root" && corrected_nested_cell.value == "corrected nested")
+while desktop_close(admission_app, admission_id) { sleep(1) }
+assert(unrelated_frame_task_cleaned && app_data(admission_app).retired_frames.len() == 0)
+print("replacement state admissions rollback passed")
+
+struct ListGateItem { id: str, scope: str, initial: int }
+let list_gate_app = application("keyed-list-test")
+let list_gate_items = state("keyed-list:items", [ListGateItem.new(id: "a", scope: "first", initial: 1), ListGateItem.new(id: "b", scope: "first", initial: 2)])
+let list_gate_shared = state("keyed-list:shared", 0)
+var list_gate_cells: #{str: State<int>} = #{}
+var list_gate_contexts: #{str: Context} = #{}
+var list_gate_cleaned: #{str: bool} = #{}
+var list_gate_notified: #{str: int} = #{}
+var list_gate_render_calls = 0
+fn ListGateRow(item: ListGateItem) -> Node {
+    list_gate_render_calls += 1
+    return Component("row", || {
+        let identity = "{item.scope}/{item.id}"
+        let cell = state("value", item.initial)
+        list_gate_cells[identity] = cell
+        if !(identity in list_gate_contexts) {
+            list_gate_contexts[identity] = context()
+            list_gate_cleaned[identity] = false
+            list_gate_notified[identity] = 0
+            context().run(|| spawn { defer { list_gate_cleaned[identity] = true }; sleep(10000) })
+        }
+        list_gate_shared.subscribe(|| { list_gate_notified[identity] += 1 })
+        return Button(|| { cell.value += 10 }, id: "increment", children: [Text(cell.value)])
+    })
+}
+let list_gate_window = list_gate_app.window("main", || Column(children: [
+    List(list_gate_items.value, |item| item.id, ListGateRow, id: "first"),
+    List([ListGateItem.new(id: "a", scope: "second", initial: 3)], |item| item.id, ListGateRow, id: "second"),
+]))
+let list_gate_id = window_data(list_gate_window).id
+let list_gate_tree = desktop_render(list_gate_app, list_gate_id)
+desktop_advance(list_gate_app)
+assert(list_gate_cells["first/a"].value == 1 && list_gate_cells["first/b"].value == 2 && list_gate_cells["second/a"].value == 3,
+    "List rows and lists need distinct logical scopes for Component('row') and state('value')")
+let list_gate_context_a = list_gate_contexts["first/a"]
+let list_gate_context_b = list_gate_contexts["first/b"]
+let list_gate_cell_a = list_gate_cells["first/a"]
+let first_row_button = list_gate_tree[0].children[0].children[0].children[0].children[0].children[0]
+assert(first_row_button.kind == "button")
+desktop_dispatch(list_gate_app, [DesktopEvent.new(window: list_gate_id, node: first_row_button.key, kind: "click", text: "", number: 0.0, checked: false, key: "")])
+assert(list_gate_cells["first/a"].value == 11 && list_gate_cells["first/b"].value == 2 && list_gate_cells["second/a"].value == 3)
+list_gate_items.value = [ListGateItem.new(id: "b", scope: "first", initial: 2), ListGateItem.new(id: "a", scope: "first", initial: 1)]
+desktop_render(list_gate_app, list_gate_id)
+assert(list_gate_contexts["first/a"] == list_gate_context_a && list_gate_contexts["first/b"] == list_gate_context_b)
+assert(list_gate_context_a.is_active() && list_gate_context_b.is_active() && list_gate_cells["first/a"] == list_gate_cell_a && list_gate_cell_a.value == 11)
+assert(!list_gate_cleaned["first/a"] && !list_gate_cleaned["first/b"], "reordering must retain each logical row's task group")
+assert(state_owners[list_gate_shared].subscriptions.len() == 3, "rerender must preserve one owned subscription per row")
+list_gate_shared.value = 1
+desktop_advance(list_gate_app)
+assert(list_gate_notified["first/a"] == 1 && list_gate_notified["first/b"] == 1 && list_gate_notified["second/a"] == 1)
+list_gate_items.value = [ListGateItem.new(id: "b", scope: "first", initial: 2)]
+desktop_render(list_gate_app, list_gate_id)
+desktop_advance(list_gate_app)
+assert(!list_gate_context_a.is_active() && list_gate_context_b.is_active() && list_gate_contexts["second/a"].is_active())
+assert(list_gate_cleaned["first/a"] && !list_gate_cleaned["first/b"] && !list_gate_cleaned["second/a"], "removal must cancel only the removed row")
+assert(state_owners[list_gate_shared].subscriptions.len() == 2)
+let list_calls_before_invalid = list_gate_render_calls
+assert(rejects(|| List([1], |number| tostring(number), |_| Text("row"), id: "")))
+assert(rejects(|| List([1], |_| "", |_| Text("row"), id: "empty-key")))
+assert(rejects(|| List([1, 1], |number| tostring(number), |_| { list_gate_render_calls += 1; return Text("row") }, id: "duplicates")))
+assert(list_gate_render_calls == list_calls_before_invalid, "duplicate/empty row keys must reject before rendering rows")
+while desktop_close(list_gate_app, list_gate_id) { sleep(1) }
+assert(list_gate_cleaned["first/b"] && list_gate_cleaned["second/a"])
+print("keyed List logical state task and subscription scopes passed")
+
+var picked = ""
+let tabs = Tabs([Tab.new(id: "a", label: "A"), Tab.new(id: "b", label: "B")], "a", |value| { picked = value })
+tabs.children[0].children[0].on_click()
+assert(picked == "a", "row callbacks must retain their own item")
+tabs.children[1].children[0].on_click()
+assert(picked == "b")
+assert(rejects(|| Split(children: [Text("one")])))
+assert(rejects(|| Progress(1.1)))
+print("desktop controller lifecycle passed")

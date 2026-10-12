@@ -1,0 +1,36 @@
+use gpui::{probe, smoke, Node, Column, Text, Button, Fragment, Style}
+
+var count = 0
+fn Tree() -> Node {
+    <Column>
+        <Text value={"Contador: {count}"} />
+        <Fragment>
+            <Button key="increment" on_click={|| { count += 1 }}>Aumentar</Button>
+        </Fragment>
+        { for label in ["a", "b"] { <Text value={label} /> } }
+        { if count > 0 { <Text value="Atualizado" /> } }
+    </Column>
+}
+
+let before = probe(Tree)
+assert_eq(before[0].children.len(), 4)
+let after_click = probe(Tree, event: 1)
+assert_eq(count, 1)
+assert_eq(after_click[0].children.len(), 5)
+assert_eq(after_click[0].children[0].text, "Contador: 1")
+assert_eq(after_click[0].children[1].children[0].key, "increment")
+print("GPUI bridge: typed trees, fragments, events and Verniz children passed")
+
+count = 0
+fn WindowContent() -> Node {
+    <Column style={Style.new(padding: 20.0)}>
+        <Button key="increment" on_click={|| { count += 1 }} style={Style.new(width: 200.0, height: 60.0, background: 0x2563eb)}>
+            Aumentar
+        </Button>
+        <Text value={"Contador: {count}"} />
+    </Column>
+}
+
+smoke(WindowContent)
+assert_eq(count, 1)
+print("GPUI window: native click updated Zolo state")
