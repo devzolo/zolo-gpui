@@ -1,0 +1,27 @@
+//! Source-based Win32 tooling; no precompiled plugin or application code.
+use plugin rust::{rust}
+extern rust from "../window.rs" use {
+    process_job as native_process_job, release_job as native_release_job, snapshot as native_snapshot, restore as native_restore, windows as native_windows,
+    activate as native_activate, click as native_click, dev_click as native_dev_click,
+    wheel as native_wheel, drag as native_drag, chord as native_chord, text as native_text,
+    close as native_close, capture as native_capture,
+}
+pub struct WindowInfo { hwnd: int, title: str }
+pub struct DesktopSnapshot { window: int, x: int, y: int, error: str }
+pub struct CaptureResult { path: str, method: str, width: int, height: int, colors: int, error: str }
+fn checked(result: Any) { assert(result.error == "", result.error) }
+pub fn snapshot() -> DesktopSnapshot { let saved = native_snapshot(); checked(saved); return saved }
+pub fn restore(saved: DesktopSnapshot) { let result = native_restore(saved.window, saved.x, saved.y); if result.error != "" { print("WINDOW_RESTORE_FAILED {result.error}") } }
+pub fn windows(pid: int, prefix: str) -> [WindowInfo] { return native_windows(pid, prefix) }
+pub fn activate(hwnd: int, pid: int) { checked(native_activate(hwnd, pid)) }
+pub fn click(hwnd: int, pid: int, x: float, y: float) { checked(native_click(hwnd, pid, x, y)) }
+pub fn dev_click(hwnd: int, pid: int, x: float, y: float) { checked(native_dev_click(hwnd, pid, x, y)) }
+pub fn wheel(hwnd: int, pid: int, x: float, y: float, delta: int) { checked(native_wheel(hwnd, pid, x, y, delta)) }
+pub fn drag(hwnd: int, pid: int, x1: float, y1: float, x2: float, y2: float) { checked(native_drag(hwnd, pid, x1, y1, x2, y2)) }
+pub fn chord(hwnd: int, pid: int, key: int, control: bool = false, shift: bool = false) { checked(native_chord(hwnd, pid, key, control, shift)) }
+pub fn text(hwnd: int, pid: int, value: str) { checked(native_text(hwnd, pid, value)) }
+pub fn close(hwnd: int, pid: int) { checked(native_close(hwnd, pid)) }
+pub fn capture(hwnd: int, pid: int, destination: str, print_window: bool) -> CaptureResult { return native_capture(hwnd, pid, destination, print_window) }
+
+pub fn process_job(pid: int) -> int { let assigned = native_process_job(pid); checked(assigned); return assigned.token }
+pub fn release_job(token: int) { checked(native_release_job(token)) }

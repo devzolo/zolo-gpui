@@ -1,0 +1,7 @@
+fn native_smoke(render:fn()->[NativeNode],dispatch:fn(int)->Any,update:fn()->NativePoll,close:fn()->bool,x:float,y:float) {
+    legacy_render = render
+    legacy_update = update
+    let action = legacy_host_action ?? panic("missing smoke scenario")
+    action()
+    while close() { sleep(1) }
+}

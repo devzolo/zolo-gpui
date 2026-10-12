@@ -1,4 +1,4 @@
-//! Real-window fixture driven by scripts/verify-desktop.ps1.
+//! Real-window fixture driven by scripts/verify-desktop.zolo.
 //! Receipts below are emitted only by native callbacks or owned task cleanup.
 use gpui::{application, state, Window, WindowOptions, Node, Style, Column, Text, Button, TextInput, Checkbox, Split}
 

@@ -1,0 +1,149 @@
+//! zolo run scripts/verify-dev.zolo -- --cli zolo [--library PATH]
+//! Native owned-window reload gate. Measurements stop at the render callback.
+use std::{path, process}
+use gpui_gate::{Gate, options, write, read, run_directory, dev, snapshot, restore, now_ms}
+fn write_view(entry: str, label: str, step: int = 1, tail: str = "") {
+    let source = r#"use gpui::{run, state, Node, Column, Text, Button, Style}
+use dev_component::label
+use dev_view::View
+let count = state("counter", 0)
+fn Counter() -> Node {
+    print("UI_RENDER:LABEL:{count.value}:{label()}")
+    <Column style={Style.new(padding: 20.0)}>
+        <Button style={Style.new(width: 200.0, height: 60.0)} on_click={|| { count.value += STEP }}>
+            <Text value={"LABEL: {count.value}"} />
+        </Button>
+    </Column>
+}
+run(Counter, title: "Zolo dev reload verification", width: 400.0, height: 240.0)
+TAIL
+"#
+    write(entry, source.replace("LABEL", label).replace("STEP", tostring(step)).replace("TAIL", tail))
+}
+fn write_component(filename: str, label: str, step: int = 1) {
+    let source = r#"use gpui::{state, Node, Column, Text, Button, Style}
+struct CounterModel { value: int }
+let count = state("component-counter", CounterModel { value: 0 })
+pub fn View() -> Node {
+    print("UI_COMPONENT:LABEL:{count.value.value}")
+    <Column style={Style.new(padding: 20.0)}>
+        <Button style={Style.new(width: 200.0, height: 60.0)} on_click={|| { count.update(|model| { model.value += STEP; return model }) }}>
+            <Text value={"LABEL: {count.value.value}"} />
+        </Button>
+    </Column>
+}
+"#
+    write(filename, source.replace("LABEL", label).replace("STEP", tostring(step)))
+}
+fn received(gate: Gate, needle: str, interval: int = 90) -> float { return gate.receipt(needle, interval, true, true) }
+fn main() {
+    let opts = options()
+    if opts.help { print("verify-dev.zolo [--cli PATH] [--library PATH]"); return }
+    let examples = path.join(opts.library, "examples")
+    let directory = run_directory(examples, "dev-verification", "vm")
+    let entry = path.join(directory, "dev-counter.zolo")
+    let module = path.join(directory, "dev_component.zolo")
+    let view = path.join(directory, "dev_view.zolo")
+    write(module, r#"pub fn label() -> str { return "module-before" }"#)
+    write_component(view, "before")
+    write_view(entry, "before")
+    let saved = snapshot()
+    defer { restore(saved) }
+    let gate = dev(opts, entry, directory)
+    defer { gate.cleanup() }
+    let boot = received(gate, "UI_RENDER:before:0:module-before", 240)
+    var native_window = 0
+    let window_deadline = now_ms() + 20000
+    while now_ms() < window_deadline {
+        gate.live()
+        let owned = gate.windows()
+        if owned.len() > 0 { native_window = owned[0].hwnd; break }
+        process.sleep(20)
+    }
+    assert(native_window != 0, "Dev child did not create its native window")
+    process.sleep(150)
+    gate.dev_click(native_window)
+    received(gate, "UI_RENDER:before:1:module-before")
+
+    var started = now_ms()
+    write_view(entry, "after")
+    received(gate, "UI_RENDER:after:1:module-before")
+    let entry_ms = now_ms() - started
+    write(entry, r#"fn Counter( {"#)
+    received(gate, "re-run failed")
+    gate.dev_click(native_window)
+    received(gate, "UI_RENDER:after:2:module-before")
+    write_view(entry, "rejected", 1, r#"error("expected reload failure")"#)
+    received(gate, "re-run failed")
+    gate.dev_click(native_window)
+    received(gate, "UI_RENDER:after:3:module-before")
+    started = now_ms()
+    write_view(entry, "recovered", 2)
+    received(gate, "UI_RENDER:recovered:3:module-before")
+    let recovery_ms = now_ms() - started
+    gate.dev_click(native_window)
+    received(gate, "UI_RENDER:recovered:5:module-before")
+    started = now_ms()
+    write(module, r#"pub fn label() -> str { return "module-after" }"#)
+    received(gate, "UI_RENDER:recovered:5:module-after")
+    let module_ms = now_ms() - started
+    write(module, r#"use plugin rust::{rust}
+extern rust from "missing.rs" use {missing}
+pub fn label() -> str { return "unadmitted-native-module" }
+"#)
+    received(gate, "native session module")
+    gate.dev_click(native_window)
+    received(gate, "UI_RENDER:recovered:7:module-after")
+    write(module, r#"pub fn label() -> str { return "module-restored" }"#)
+    received(gate, "UI_RENDER:recovered:7:module-restored")
+    write(entry, r#"use gpui::run
+use dev_view::View
+run(View, title: "Zolo dev reload verification", width: 400.0, height: 240.0)
+"#)
+    received(gate, "UI_COMPONENT:before:0")
+    gate.dev_click(native_window)
+    received(gate, "UI_COMPONENT:before:1")
+    started = now_ms()
+    write_component(view, "after", 3)
+    received(gate, "UI_COMPONENT:after:1")
+    let component_ms = now_ms() - started
+    gate.dev_click(native_window)
+    received(gate, "UI_COMPONENT:after:4")
+    let typed_source = read(view)
+    write(view, typed_source + r#"
+let incompatible = state("component-counter", [4])
+"#)
+    received(gate, "changed type; use a new key")
+    gate.dev_click(native_window)
+    received(gate, "UI_COMPONENT:after:7")
+    write(view, typed_source)
+    received(gate, "UI_COMPONENT:after:7")
+    let prop_source = read(view).replace(r#"pub fn View() -> Node {"#, r#"pub fn View(caption: str = "default") -> Node {"#)
+        .replace(r#"print("UI_COMPONENT:"#, r#"print("UI_PROP:{caption}")
+    print("UI_COMPONENT:"#)
+    write(view, prop_source)
+    received(gate, "UI_PROP:default")
+    write(entry, r#"use gpui::run
+use dev_view::View
+run(|| View(caption: "named"), title: "Zolo dev reload verification", width: 400.0, height: 240.0)
+"#)
+    received(gate, "UI_PROP:named")
+    received(gate, "UI_COMPONENT:after:7")
+    let burst = read(entry)
+    started = now_ms()
+    for caption in ["first", "second", "latest"] {
+        write(entry, burst.replace(r#""named""#, "\"{caption}\""))
+        process.sleep(10)
+    }
+    received(gate, "UI_PROP:latest")
+    received(gate, "UI_COMPONENT:after:7")
+    let burst_ms = now_ms() - started
+    gate.dev_click(native_window)
+    received(gate, "UI_COMPONENT:after:10")
+    let owned = gate.windows()
+    assert(owned.len() == 1 && owned[0].hwnd == native_window, "Reload replaced the window")
+    gate.close(native_window)
+    gate.finish()
+    gate.record("DEV_RECEIPT boot={boot}ms entry={entry_ms}ms recovery={recovery_ms}ms module={module_ms}ms component={component_ms}ms burst={burst_ms}ms measurement=render_callback state=7 component_state=10 nominal_schema_preserved=true incompatible_schema_rejected=true same_window=true close=0 native_session_guard=true new_named_prop=true rapid_saves=true")
+}
+main()

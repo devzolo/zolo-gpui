@@ -1,0 +1,5 @@
+//! Run the private-controller gate with explicit native rendering stubs.
+mod fixture_tools
+use fixture_tools::{verify_core, script_dir}
+use std::process
+process.exit(verify_core(process.argv(), script_dir()))

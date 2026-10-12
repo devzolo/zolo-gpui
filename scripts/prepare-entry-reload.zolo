@@ -1,0 +1,7 @@
+//! Prepare isolated real-library host fixtures.
+mod fixture_tools
+use fixture_tools::{prepare_entry, validate, script_dir}
+use std::process
+let args = process.argv()
+validate(args, ["--library", "--fixture", "--output-dir"])
+prepare_entry(args, script_dir())

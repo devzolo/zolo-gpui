@@ -1,0 +1,265 @@
+//! Local tooling package. All test orchestration, deadlines and assertions live in Zolo.
+use std::{fs, path, process, env}
+use std::cmd::{command, Cmd, ProcHandle, Output}
+use window as native_ui
+
+pub struct Options {
+    zolo: str = "zolo", backend: str = "vm", executable: str = "", library: str = "",
+    startup_timeout: int = 900, step_timeout: int = 20,
+    skip_install: bool = false, async_case: bool = false, async_failure: bool = false,
+    help: bool = false,
+}
+pub fn options() -> Options {
+    let raw = process.argv()
+    let result = Options {}
+    var start = 1
+    for i in 0..raw.len() {
+        if raw[i].ends_with(".zolo") {
+            result.library = path.dirname(path.dirname(path.resolve(raw[i])))
+            start = i + 1
+            break
+        }
+    }
+    if result.library == "" { result.library = path.resolve(".") }
+    var i = start
+    while i < raw.len() {
+        let flag = raw[i]
+        if flag == "--" || flag == "--no-cache" { i += 1; continue }
+        if flag == "--help" || flag == "-h" { result.help = true; i += 1; continue }
+        if flag == "--skip-install" || flag == "-SkipInstall" { result.skip_install = true; i += 1; continue }
+        if flag == "--async" || flag == "-Async" { result.async_case = true; i += 1; continue }
+        if flag == "--async-failure" || flag == "-AsyncFailure" { result.async_failure = true; i += 1; continue }
+        assert(i + 1 < raw.len(), "Missing value for {flag}")
+        let value = raw[i + 1]
+        if flag == "--cli" || flag == "--zolo" || flag == "-Zolo" { result.zolo = value }
+        else if flag == "--backend" || flag == "-Backend" { result.backend = value }
+        else if flag == "--executable" || flag == "-Executable" { result.executable = path.resolve(value) }
+        else if flag == "--library" || flag == "-Library" { result.library = path.resolve(value) }
+        else if flag == "--startup-timeout-seconds" || flag == "-StartupTimeoutSeconds" { result.startup_timeout = (tonumber(value) as? int) ?? panic("Timeout must be an integer") }
+        else if flag == "--step-timeout-seconds" || flag == "-StepTimeoutSeconds" { result.step_timeout = (tonumber(value) as? int) ?? panic("Timeout must be an integer") }
+        else { panic("Unknown option: {flag}") }
+        i += 2
+    }
+    assert(result.backend == "vm" || result.backend == "native" || result.backend == "llvm", "Backend must be vm, native or llvm")
+    assert(result.startup_timeout > 0 && result.step_timeout > 0, "Timeouts must be positive seconds")
+    assert(fs.is_file(path.join(result.library, "examples", "zolo.toml")), "Library examples consumer is missing: {result.library}")
+    return result
+}
+pub fn process_job(child: ProcHandle) -> int {
+    if env.os() != "windows" { return 0 }
+    return native_ui::process_job(child.pid())
+}
+pub fn release_job(token: int) { if token > 0 { native_ui::release_job(token) } }
+pub fn now_ms() -> float { return process.uptime() * 1000.0 }
+pub fn mkdir(directory: str) { assert(fs.mkdir(directory) != nil, "Could not create {directory}") }
+pub fn write(filename: str, source: str) { assert(fs.write(filename, source) != nil, "Could not write {filename}") }
+pub fn read(filename: str) -> str { let source = fs.read(filename); assert(source != nil, "Could not read {filename}"); return (source as? str) ?? panic("Expected UTF8 text") }
+pub fn copy(source: str, destination: str) { assert(fs.copy(source, destination) != nil, "Could not copy {source} to {destination}") }
+pub fn run_directory(root: str, group: str, backend: str) -> str {
+    let identifier = "{process.pid()}-{process.uptime()}".replace(".", "-")
+    let directory = path.join(root, "target", group, backend, identifier)
+    mkdir(directory)
+    return directory
+}
+// Argument arrays are passed directly; none of these gates invokes a shell.
+pub fn invoke(executable: str, arguments: [str], cwd: str, timeout_ms: int) -> Output {
+    let child = command(executable, arguments).cwd(cwd).spawn()
+    defer { child.close() }
+    let job = process_job(child)
+    defer { release_job(job) }
+    var stdout = ""
+    var stderr = ""
+    let deadline = now_ms() + timeout_ms
+    while true {
+        for _ in 0..64 {
+            let line = child.read_line(0)
+            if line == nil { break }
+            stdout += "{line}\n"; print(line)
+        }
+        for _ in 0..64 {
+            let line = child.read_err_line(0)
+            if line == nil { break }
+            stderr += "{line}\n"; print(line)
+        }
+        assert(stdout.len() + stderr.len() <= 4194304, "Command exceeded 4 MiB output: {executable}")
+        if !child.alive() {
+            let status = child.wait()
+            let tail = finished_output(child)
+            stdout += tail.stdout; stderr += tail.stderr
+            assert(stdout.len() + stderr.len() <= 4194304, "Command exceeded 4 MiB output including final tail")
+            assert(status == 0, "Command exited {status}: {executable} {arguments:?}\n{stderr}")
+            return Output {stdout: stdout, stderr: stderr, status: status}
+        }
+        assert(now_ms() < deadline, "Command exceeded {timeout_ms} ms: {executable}")
+        process.sleep(10)
+    }
+}
+/// Reap and drain both pipes within a finite deadline, including their real EOF.
+pub fn finished_output(child: ProcHandle, limit_ms: int = 5000) -> Output {
+    let status = child.wait()
+    let deadline = now_ms() + limit_ms
+    var stdout = ""
+    var stderr = ""
+    while !child.output_closed() {
+        for _ in 0..64 { let line = child.read_line(20); if line == nil { break }; stdout += "{line}\n"; print(line) }
+        for _ in 0..64 { let line = child.read_err_line(20); if line == nil { break }; stderr += "{line}\n"; print(line) }
+        assert(stdout.len() + stderr.len() <= 4194304, "Finished command exceeded 4 MiB logs")
+        assert(child.output_closed() || now_ms() < deadline, "Finished child pipes did not reach EOF within {limit_ms}ms")
+    }
+    return Output {stdout: stdout, stderr: stderr, status: status}
+}
+pub fn source_free(cmd: Cmd, deployment: str, run_dir: str) -> Cmd {
+    let system = env.get("SystemRoot") ?? "C:/Windows"
+    var result = cmd.cwd(deployment).env("PATH", "{system}/System32;{system}")
+    for name in ["ZOLO_RUSTC", "ZOLO_CARGO", "ZOLO_CARGO_EXECUTABLE"] { result = result.env(name, "missing-compiler-for-desktop-source-free-gate") }
+    for name in ["ZOLO_PLUGIN_DIR", "ZOLO_STORE_DIR", "ZOLO_FOREIGN_CACHE", "ZOLO_FOREIGN_PREPARE_CACHE"] { result = result.env(name, path.join(run_dir, "missing-{name}")) }
+    return result
+}
+pub struct Gate {
+    child: ProcHandle, pid: int, job: int, prefix: str, directory: str, group: str,
+    step_timeout: int, backend: str, source_free: bool,
+    history: [str] = [], captured_chars: int = 0, receipt_index: int = 0,
+}
+impl Gate {
+    pub fn record(self, line: str) {
+        self.captured_chars += line.len()
+        assert(self.captured_chars <= 4194304, "Owned child exceeded 4 MiB receipts")
+        self.history.push(line); print(line)
+    }
+    pub fn drain(self) {
+        for _ in 0..64 { let line = self.child.read_line(0); if line == nil { break }; self.record(line) }
+        for _ in 0..64 { let line = self.child.read_err_line(0); if line == nil { break }; self.record(line) }
+    }
+    pub fn drain_final(self, limit_ms: int = 5000) {
+        let deadline = now_ms() + limit_ms
+        while !self.child.output_closed() {
+            for _ in 0..64 { let line = self.child.read_line(20); if line == nil { break }; self.record(line) }
+            for _ in 0..64 { let line = self.child.read_err_line(20); if line == nil { break }; self.record(line) }
+            assert(self.child.output_closed() || now_ms() < deadline, "Owned child pipes did not reach EOF within {limit_ms}ms")
+        }
+    }
+    pub fn live(self) { self.drain(); assert(self.child.alive(), "Owned child exited before the UI gate completed") }
+    pub fn receipt(self, needle: str, timeout_seconds: int = 0, substring: bool = false, fresh: bool = false) -> float {
+        let started = now_ms()
+        let interval = if timeout_seconds > 0 { timeout_seconds } else { self.step_timeout }
+        while now_ms() - started < ((interval as? float) ?? panic("Timeout exceeds exact numeric range")) * 1000.0 {
+            self.drain()
+            var index = if fresh { self.receipt_index } else { 0 }
+            while index < self.history.len() {
+                let line = self.history[index]; index += 1
+                if fresh { self.receipt_index = index; assert(!line.contains("initial run failed"), "Initial UI failed: {line}") }
+                if line == needle || (substring && line.contains(needle)) { return now_ms() - started }
+            }
+            if !self.child.alive() {
+                let code = self.child.wait(); self.drain_final()
+                var final_index = if fresh { self.receipt_index } else { 0 }
+                while final_index < self.history.len() {
+                    let line = self.history[final_index]; final_index += 1
+                    if fresh { self.receipt_index = final_index }
+                    if line == needle || (substring && line.contains(needle)) { return now_ms() - started }
+                }
+                panic("Owned child exited {code} before receipt: {needle}")
+            }
+            process.sleep(15)
+        }
+        panic("Missing receipt: {needle}")
+    }
+    pub fn window(self, title: str) -> int {
+        let deadline = now_ms() + self.step_timeout * 1000
+        while now_ms() < deadline {
+            self.live()
+            for owned in native_ui::windows(self.pid, self.prefix) { if owned.title == title { return owned.hwnd } }
+            process.sleep(20)
+        }
+        panic("Owned native window missing: {title}")
+    }
+    pub fn windows(self) -> [native_ui::WindowInfo] { return native_ui::windows(self.pid, self.prefix) }
+    pub fn activate(self, hwnd: int) { self.live(); native_ui::activate(hwnd, self.pid) }
+    pub fn click(self, hwnd: int, x: float, y: float) { self.live(); native_ui::click(hwnd, self.pid, x, y); process.sleep(150) }
+    pub fn dev_click(self, hwnd: int) { self.live(); native_ui::dev_click(hwnd, self.pid, 40.0, 40.0) }
+    pub fn key(self, hwnd: int, key: int, control: bool = false, shift: bool = false) { self.live(); native_ui::chord(hwnd, self.pid, key, control, shift) }
+    pub fn text(self, hwnd: int, value: str) { self.live(); native_ui::text(hwnd, self.pid, value) }
+    pub fn drag(self, hwnd: int, x1: float, y1: float, x2: float, y2: float) { self.live(); native_ui::drag(hwnd, self.pid, x1, y1, x2, y2) }
+    pub fn wheel(self, hwnd: int, x: float, y: float, delta: int) { self.live(); native_ui::wheel(hwnd, self.pid, x, y, delta) }
+    pub fn close(self, hwnd: int) { native_ui::close(hwnd, self.pid) }
+    pub fn screenshot(self, hwnd: int, name: str) -> str {
+        self.live()
+        let destination = path.join(self.directory, name)
+        var failure = "Owned GPU window capture contained no UI"
+        for print_window in [true, false] {
+            let image = native_ui::capture(hwnd, self.pid, destination, print_window)
+            if image.error != "" { failure = image.error; continue }
+            if image.colors < 4 { failure = "Owned GPU window capture contained no UI"; continue }
+            self.record("{self.group}_SCREENSHOT path={destination} method={image.method} width={image.width} height={image.height}")
+            return destination
+        }
+        panic(failure)
+    }
+    pub fn optional_screenshot(self, hwnd: int, name: str) {
+        try { self.screenshot(hwnd, name) }
+        catch failure { self.record("{self.group}_SCREENSHOT_UNAVAILABLE {failure}") }
+    }
+    pub fn finish(self, timeout_ms: int = 15000) {
+        let deadline = now_ms() + timeout_ms
+        while self.child.alive() && now_ms() < deadline { self.drain(); process.sleep(15) }
+        assert(!self.child.alive(), "Closing the final window did not finish the owned application")
+        let code = self.child.wait(); self.drain_final(); assert(code == 0, "Owned child exited {code}")
+    }
+    pub fn cleanup(self) {
+        defer { self.child.close() }
+        let receipt = path.join(self.directory, "receipt.log")
+        defer { write(receipt, self.history.join("\n") + "\n"); print("{self.group}_GATE receipt: {receipt}") }
+        if self.child.alive() {
+            for owned in self.windows() { try { self.close(owned.hwnd) } catch failure { print("WINDOW_CLOSE_FAILED {failure}") } }
+            let deadline = now_ms() + 5000
+            while self.child.alive() && now_ms() < deadline { process.sleep(15) }
+        }
+        release_job(self.job)
+        if self.child.alive() { self.child.kill() }
+        self.child.wait()
+        try { self.drain_final() } catch failure { self.history.push("OUTPUT_DRAIN_FAILED {failure}"); print("OUTPUT_DRAIN_FAILED {failure}") }
+    }
+}
+pub fn desktop(options: Options, example: str, group: str, prefix: str) -> Gate {
+    assert(env.os() == "windows", "This gate requires an interactive Windows desktop")
+    let directory = run_directory(options.library, "{group.lower()}-verification", options.backend)
+    let examples = path.join(options.library, "examples")
+    let fixture = path.join(examples, "{example}.zolo")
+    let deployment = path.join(directory, "deployment")
+    var launch = options.zolo
+    var embedded = options.executable != "" || options.backend != "vm"
+    if embedded {
+        mkdir(deployment)
+        launch = path.join(deployment, "{example}.exe")
+        if options.executable != "" { copy(options.executable, launch) }
+        else {
+            print("{group}_GATE preparing {options.backend} embedded executable")
+            let base = path.join(directory, example)
+            invoke(options.zolo, ["build", fixture, "--emit", options.backend, "--plugins", "embed", "-o", base], examples, options.startup_timeout * 1000)
+            copy("{base}.exe", launch)
+        }
+    }
+    var cmd = if embedded { source_free(command(launch, []), deployment, directory) } else { command(launch, ["run", fixture, "--no-cache"]).cwd(examples) }
+    print("{group}_GATE starting {options.backend} real-window gate; first Rust preparation may take several minutes")
+    let child = cmd.spawn()
+    var transferred = false
+    defer { if !transferred { child.close() } }
+    let job = process_job(child)
+    defer { if !transferred { release_job(job) } }
+    let pid = child.pid()
+    assert(pid > 0, "Owned command has no child PID")
+    transferred = true
+    return Gate {child: child, pid: pid, job: job, prefix: prefix, directory: directory, group: group, step_timeout: options.step_timeout, backend: options.backend, source_free: embedded}
+}
+pub fn dev(options: Options, entry: str, directory: str) -> Gate {
+    let cmd = command(options.zolo, ["dev", entry]).cwd(path.join(options.library, "examples")).env_remove("ZOLO_DEV_TIMINGS")
+    let child = cmd.spawn()
+    var transferred = false
+    defer { if !transferred { child.close() } }
+    let job = process_job(child)
+    defer { if !transferred { release_job(job) } }
+    transferred = true
+    return Gate {child: child, pid: child.pid(), job: job, prefix: "Zolo dev reload verification", directory: directory, group: "DEV", step_timeout: 90, backend: "vm", source_free: false}
+}
+pub fn snapshot() -> native_ui::DesktopSnapshot { return native_ui::snapshot() }
+pub fn restore(saved: native_ui::DesktopSnapshot) { native_ui::restore(saved) }

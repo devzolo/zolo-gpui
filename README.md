@@ -54,10 +54,10 @@ Run `zolo dev async_counter.zolo` for an asynchronous event example.
 From the library root:
 
 ```powershell
-pwsh -File scripts/verify.ps1
-pwsh -File scripts/verify-desktop.ps1
-pwsh -File scripts/verify-dev.ps1
-node scripts/verify-core.cjs --library . --language-root <Zolo checkout> --reify --run --cli <fresh CLI>
+zolo run scripts/verify.zolo
+zolo run scripts/verify-desktop.zolo
+zolo run scripts/verify-dev.zolo
+zolo run scripts/verify-core.zolo -- --library . --language-root "C:/path/to/zolo-lang" --reify --run --cli "C:/path/to/zolo.exe"
 ```
 
 The window gates cover state, typed trees, Verniz children, controlled input,

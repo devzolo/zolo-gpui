@@ -1,0 +1,50 @@
+//! Run from the repository root: zolo run scripts/verify.zolo -- --cli zolo [--skip-install] [--async|--async-failure]
+//! Native and LLVM deployment gates copy only the executable and remove compiler/cache access.
+use std::{path, process}
+use std::cmd::command
+use gpui_gate::{options, invoke, mkdir, copy, source_free, now_ms, finished_output, process_job, release_job}
+fn main() {
+    let opts = options()
+    if opts.help { print("verify.zolo [--cli PATH] [--library PATH] [--skip-install] [--async|--async-failure]"); return }
+    let examples = path.join(opts.library, "examples")
+    let example = if opts.async_failure { "async_failure_smoke" } else if opts.async_case { "async_smoke" } else { "integration" }
+    let expected = if opts.async_failure { "async event failure cancels siblings, drains cleanup and preserves the original error: ok" }
+        else if opts.async_case { "async completion, responsive rendering, Shutdown cancellation and cleanup: ok" }
+        else { "GPUI bridge: typed trees, fragments, events and Verniz children passed\nGPUI window: native click updated Zolo state" }
+    if !opts.skip_install { invoke(opts.zolo, ["install", "--offline"], examples, 900000) }
+    let vm = invoke(opts.zolo, ["run", "{example}.zolo", "--no-cache"], examples, 900000)
+    assert(vm.stdout.trim() == expected, "VM and native window: unexpected output:\n{vm.stdout}")
+    print("VM and native window passed")
+    for backend in ["native", "llvm"] {
+        let artifacts = path.join(opts.library, "target", "verification", backend)
+        mkdir(artifacts)
+        let destination = path.join(artifacts, example)
+        invoke(opts.zolo, ["build", "{example}.zolo", "--emit", backend, "--plugins", "embed", "-o", destination], examples, 900000)
+        let deployment = path.join(artifacts, "deployment")
+        mkdir(deployment)
+        let executable = path.join(deployment, "{example}.exe")
+        copy("{destination}.exe", executable)
+        let child = source_free(command(executable, []), deployment, deployment).spawn()
+        defer { child.close() }
+        let job = process_job(child)
+        defer { release_job(job) }
+        var stdout = ""
+        var stderr = ""
+        let deadline = now_ms() + 30000
+        while child.alive() {
+            for _ in 0..64 { let line = child.read_line(0); if line == nil { break }; stdout += "{line}\n" }
+            for _ in 0..64 { let line = child.read_err_line(0); if line == nil { break }; stderr += "{line}\n" }
+            assert(stdout.len() + stderr.len() <= 4194304, "Deployment exceeded 4 MiB logs")
+            assert(now_ms() < deadline, "{backend} deployment did not close its window within 30 seconds")
+            process.sleep(10)
+        }
+        let status = child.wait()
+        let tail = finished_output(child)
+        stdout += tail.stdout; stderr += tail.stderr
+        assert(stdout.len() + stderr.len() <= 4194304, "Deployment exceeded 4 MiB logs including final tail")
+        assert(status == 0, "{backend} deployment failed: {stderr}")
+        assert(stdout.trim() == expected, "{backend}: unexpected output:\n{stdout}")
+        print("{backend} source-free deployment and native window passed")
+    }
+}
+main()

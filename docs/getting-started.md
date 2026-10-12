@@ -15,6 +15,10 @@ Use a current Zolo build and matching Rust provider/editor server. The required
 Older installations with the same `0.1.8-alpha` version label may lack these
 features; the version label alone does not establish compatibility.
 
+The repository's verification scripts also require the structured command and
+finite stream APIs in [Zolo bd647c2](https://github.com/devzolo/zolo-lang/commit/bd647c2) or later.
+See [the script guide](../scripts/README.md) for tooling requirements.
+
 ## Add GPUI to your application
 
 Create `zolo.toml` in your project:

@@ -1,0 +1,8 @@
+
+fn native_run(title:str,width:float,height:float,updates:bool,render:fn()->[NativeNode],dispatch:fn(int)->Any,update:fn()->NativePoll,close:fn()->bool) {}
+fn native_smoke(render:fn()->[NativeNode],dispatch:fn(int)->Any,update:fn()->NativePoll,close:fn()->bool,x:float,y:float) {}
+fn native_probe(render:fn()->[NativeNode],dispatch:fn(int)->Any,event:int)->Any {return render()}
+fn native_desktop(initial:[DesktopWindow],updates:bool,render:fn(int)->[DesktopNode],dispatch:fn([DesktopEvent])->nil,advance:fn()->DesktopTurn,close:fn(int)->bool) {}
+var injected_native_validation_error = ""
+var injected_native_validation_hook: (fn() -> void)? = nil
+fn native_validate(_nodes:[DesktopNode])->str { if injected_native_validation_hook != nil { injected_native_validation_hook() }; return injected_native_validation_error }

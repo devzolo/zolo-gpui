@@ -10,3 +10,11 @@
 # Generated local foreign preparation and consumer locks.
 /zolo.lock
 /examples/zolo.lock
+
+# Local development tooling caches.
+/scripts/zolo.lock
+/scripts/target/
+/scripts/.zolo/
+/scripts/support/zolo.lock
+/scripts/support/target/
+/scripts/support/.zolo/

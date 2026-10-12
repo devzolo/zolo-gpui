@@ -136,7 +136,7 @@ made by application code are not transactional; keep view construction
 declarative. New native imports or edits to admitted Rust sources request a
 session restart.
 
-`pwsh -File scripts/verify-dev.ps1` measures source-write to the Zolo render
+`zolo run scripts/verify-dev.zolo` measures source-write to the Zolo render
 callback in an actual owned window. It also checks state, window identity,
 rejected schemas, error recovery, imported props and rapid successive saves.
 This receipt does not measure the operating system's completed screen paint.
@@ -158,26 +158,26 @@ in standalone wasm. The adapter uses pinned GPUI 0.2.2.
 Unicode keyboard input and native editing are verified; physical OS IME
 composition has not been exercised by the actual-window gates.
 
-From the library root, `scripts/verify-desktop.ps1`
-exercise actual owned windows with the installed CLI (`-Backend native` or
-`-Backend llvm` also checks a copied executable without source compilers).
-`scripts/verify-core.cjs` retains the private state/controller regressions in
+From the library root, run `zolo run scripts/verify-desktop.zolo` to
+exercise actual owned windows with the installed CLI (`-- --backend native` or
+`-- --backend llvm` also checks a copied executable without source compilers).
+`scripts/verify-core.zolo` retains the state and lifecycle regressions in
 `tests/pure`. It requires Rust and the Zolo source checkout:
 
 ```powershell
-node scripts/verify-core.cjs --library . --language-root <Zolo checkout> --reify --run --cli <fresh CLI>
+zolo run scripts/verify-core.zolo -- --library . --language-root "C:/path/to/zolo-lang" --reify --run --cli "C:/path/to/zolo.exe"
 ```
 
 That isolated fixture stubs native functions and adjusts generated top-level
 locals for Lua's chunk limit. Its results complement the actual window gates.
 
-`node scripts/verify-normal-host-drain.cjs --cli <fresh CLI>` checks normal host
+`zolo run scripts/verify-normal-host-drain.zolo -- --cli "C:/path/to/zolo.exe"` checks normal host
 return, host errors and cleanup errors on VM/native/LLVM. Its generated host is
 an explicit stub; async cleanup and context lifetime use the actual library.
 The platform may exit before its next close callback. `App.run` still drains
 every owned group before returning, and preserves the original host error.
 
-`node scripts/verify-entry-reload.cjs --cli <fresh CLI>` checks rejected entry
+`zolo run scripts/verify-entry-reload.zolo -- --cli "C:/path/to/zolo.exe"` checks rejected entry
 replays, mixed module/entry batches, multiple entries and retired window cleanup.
 The renderer uses the generic `std::ui::poll_updates(on_begin, on_end)` callbacks:
 each execution has a separate snapshot and success result. An aggregate update

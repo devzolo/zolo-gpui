@@ -1,0 +1,5 @@
+//! Check every receipt across VM, native and LLVM (or --backend).
+mod fixture_tools
+use fixture_tools::{verify_oracle, script_dir}
+use std::process
+process.exit(verify_oracle(process.argv(), script_dir(), true))

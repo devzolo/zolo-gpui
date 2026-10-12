@@ -1,0 +1,7 @@
+fn native_desktop(initial:[DesktopWindow],updates:bool,render:fn(int)->[DesktopNode],dispatch:fn([DesktopEvent])->nil,advance:fn()->DesktopTurn,close:fn(int)->bool) {
+    reload_render = render
+    reload_dispatch = dispatch
+    reload_advance = advance
+    let action = reload_host_action ?? panic("missing host scenario")
+    action()
+}

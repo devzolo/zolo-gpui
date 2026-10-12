@@ -1,0 +1,7 @@
+[project]
+entry = "verify.zolo"
+name = "zolo-gpui-scripts"
+version = "0.1.0"
+
+[dependencies]
+gpui_gate = { path = "support" }
