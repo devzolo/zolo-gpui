@@ -50,9 +50,10 @@ pub fn validate(args: [str], allowed: [str], switches: [str] = []) {
     }
 }
 
-pub fn read(file: str) -> str { return fs.read(file) ?? panic("Cannot read " + file) }
-pub fn write(file: str, text: str) { assert(fs.write(file, text) != nil, "Cannot write " + file) }
-pub fn mkdir(dir: str) { assert(fs.mkdir(dir) != nil, "Cannot create " + dir) }
+pub fn read(file: str) -> str = fs.read(file) recover { message => panic("Cannot read {file}: {message}") }
+pub fn write(file: str, text: str) { fs.write(file, text) recover { message => panic("Cannot write {file}: {message}") } }
+pub fn mkdir(dir: str) { fs.mkdir(dir) recover { message => panic("Cannot create {dir}: {message}") } }
+pub fn copy(source: str, destination: str) { fs.copy(source, destination) recover { message => panic("Cannot copy {source}: {message}") } }
 pub fn script_dir() -> str { return path.dirname(path.resolve(process.argv()[0])) }
 pub fn executable_suffix() -> str { return if env.os() == "windows" { ".exe" } else { "" } }
 pub fn selected_cli(args: [str]) -> str { return option(args, "cli") ?? env.get("ZOLO_BIN") ?? "zolo" }
@@ -95,8 +96,7 @@ pub fn strip_provider(source: str) -> str {
 }
 
 pub fn replace_once(text: str, needle: str, replacement: str) -> str {
-    let index = text.index_of(needle)
-    assert(index >= 0, "Fixture source changed; missing transformation: " + needle)
+    let index = text.index_of(needle) ?? panic("Fixture source changed; missing transformation: " + needle)
     return text.slice(0, index) + replacement + text.slice(index + needle.len(), nil)
 }
 
@@ -109,7 +109,7 @@ pub fn prepare_normal(args: [str], scripts: str, default_output: str = "normal-h
     let dir = path.resolve(option(args, "output-dir") ?? path.join(root, "target", default_output))
     mkdir(dir)
     write(path.join(dir, "group_host.zolo"), strip_provider(read(source)) + fixture_resource(scripts, "normal-host.zolo.fixture"))
-    assert(fs.copy(fixture, path.join(dir, "main.zolo")) != nil, "Cannot copy " + fixture)
+    copy(fixture, path.join(dir, "main.zolo"))
     print("Prepared real-library non-GUI host-return drain oracle in " + dir)
     return dir
 }
@@ -123,16 +123,14 @@ pub fn prepare_entry(args: [str], scripts: str) -> str {
     let source = path.join(dir, "group_host.zolo")
     var text = read(source)
     text = replace_once(text, "use std::ui::\{collect, begin_updates, poll_updates, end_updates\}", "use std::ui::\{collect\}")
-    let desktop_start = text.index_of("fn native_desktop(initial:")
-    assert(desktop_start >= 0, "Missing fixture native_desktop")
-    let desktop_end = text.index_of("\n}", desktop_start) + 2
-    assert(desktop_end > desktop_start, "Missing native_desktop end")
+    let desktop_start = text.index_of("fn native_desktop(initial:") ?? panic("Missing fixture native_desktop")
+    let desktop_end = (text.index_of("\n}", desktop_start) ?? panic("Missing native_desktop end")) + 2
     text = text.slice(0, desktop_start) + fixture_resource(scripts, "entry-desktop.zolo.fixture") + text.slice(desktop_end, nil)
     text = replace_once(text, "fn native_smoke(render:fn()->[NativeNode],dispatch:fn(int)->Any,update:fn()->NativePoll,close:fn()->bool,x:float,y:float) \{\}", fixture_resource(scripts, "entry-smoke.zolo.fixture"))
     text += fixture_resource(scripts, "entry-reload.zolo.fixture")
     write(source, text)
     let fixture = path.resolve(option(args, "fixture") ?? path.join(path.dirname(scripts), "tests", "entry-reload.zolo"))
-    assert(fs.copy(fixture, path.join(dir, "main.zolo")) != nil, "Cannot copy " + fixture)
+    copy(fixture, path.join(dir, "main.zolo"))
     print("Prepared entry reload publication oracle in " + dir)
     return dir
 }
@@ -194,7 +192,7 @@ pub fn verify_core(args: [str], scripts: str) -> int {
     let cli = cli_path(option(args, "cli") ?? env.get("ZOLO_GPUI_TEST_CLI") ?? env.get("ZOLO_BIN") ?? "zolo")
     assert(fs.exists(cli), "Build the current Zolo CLI or supply --cli: " + cli)
     let cli_hash = match hash.sha256_file(cli, 1073741824) { .Ok(value) => value, .Err(message) => panic(message) }
-    let stat = fs.stat(cli) ?? panic("Cannot stat " + cli)
+    let stat = fs.stat(cli) recover { message => panic("Cannot stat {cli}: {message}") }
     let cli_receipt = "GPUI_PURE_CLI path={cli}; sha256={cli_hash}; modified_unix={stat.modified}"
     let input_receipt = "GPUI_PURE_INPUT source={source_dir}; tests={tests_dir}; language={language}; artifacts={output}"
     print(cli_receipt)
@@ -264,7 +262,7 @@ fn run_core(scripts: str, output: str, language: str, compiled: Capture, cli_rec
     let manifest = "[package]\nname=\"gpui-core-fixture\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n[dependencies]\nzolo-vm=\{path=" + vm_path + "\}\nzolo-std=\{path=" + std_path + "\}\n"
     write(path.join(runner_dir, "Cargo.toml"), manifest)
     write(path.join(runner_dir, "src", "main.rs"), fixture_resource(scripts, "vm-runner.rs"))
-    if !fs.exists(path.join(runner_dir, "Cargo.lock")) { assert(fs.copy(path.join(language, "Cargo.lock"), path.join(runner_dir, "Cargo.lock")) != nil, "Cannot copy language lock") }
+    if !fs.exists(path.join(runner_dir, "Cargo.lock")) { copy(path.join(language, "Cargo.lock"), path.join(runner_dir, "Cargo.lock")) }
     print("Building isolated Rust VM executor (offline)…")
     let build = capture("cargo", ["build", "--offline", "--manifest-path", path.join(runner_dir, "Cargo.toml"), "--target-dir", path.join(language, "target")], 600000, 10485760)
     write(path.join(output, "core-runner.build.log"), build.stdout + build.stderr + build.error)
