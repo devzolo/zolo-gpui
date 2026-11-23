@@ -91,8 +91,9 @@ fn remove_lines(text: str, prefixes: [str]) -> str {
 
 pub fn strip_provider(source: str) -> str {
     var text = remove_lines(source, ["use plugin"])
-    text = regex.replace("extern rust deps %b\{\}", text, "")
-    return regex.replace("extern rust from[^\{]+%b\{\}", text, "")
+    // Provider blocks hold no nested braces; one that did would stay and fail loudly.
+    text = regex.replace_all(r"extern rust deps \{[^{}]*\}", text, "")
+    return regex.replace_all(r"extern rust from[^{]+\{[^{}]*\}", text, "")
 }
 
 pub fn replace_once(text: str, needle: str, replacement: str) -> str {
@@ -201,7 +202,7 @@ pub fn verify_core(args: [str], scripts: str) -> int {
     if !args.contains("--reify") { text = text.replace("@reify(T)", "").replace("typeinfo(T).key", "\"preliminary-schema\"") }
     for extra in values(args, "append-source") {
         var body = strip_provider(read(path.resolve(extra)))
-        body = regex.replace("use gpui::%b\{\}", body, "")
+        body = regex.replace_all(r"use gpui::\{[^{}]*\}", body, "")
         body = remove_lines(body, values(args, "strip-use-prefix"))
         text += "\n" + body
     }
