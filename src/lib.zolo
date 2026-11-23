@@ -48,11 +48,10 @@ pub fn state<T>(key: str, initial: T) -> State<T> {
     if rendering_window != nil {
         let window = window_data(rendering_window)
         let owner = app_data(window.app)
-        let component = if rendering_component == nil { "root" } else { component_registry[rendering_component].key }
+        let component = if let current = rendering_component { component_data(current).key } else { "root" }
         scoped = "window/{key_segment(owner.key)}/{key_segment(window.key)}/{component}/{key_segment(key)}"
     }
-    if scoped in states {
-        let old = states[scoped]
+    if let old = states[scoped] {
         assert(old.schema == schema, "state '{scoped}' changed type; use a new key or restart the session")
         return old.cell
     }
@@ -66,23 +65,25 @@ pub fn state<T>(key: str, initial: T) -> State<T> {
     return cell
 }
 
+fn state_owner(cell: Any) -> StateOwner {
+    return state_owners[cell] ?? panic("state must be created with state()")
+}
+
 fn state_read(cell: Any) {
-    assert(cell in state_owners, "state must be created with state()")
-    let owner = state_owners[cell]
+    let owner = state_owner(cell)
     if rendering_window != nil { owner.windows[rendering_window] = true }
     if rendering_component != nil { owner.components[rendering_component] = true }
 }
 
 fn state_changed(cell: Any) {
-    let owner = state_owners[cell]
+    let owner = state_owner(cell)
     for window, _ in owner.windows { if window in window_registry { window_data(window).dirty = true } }
     for component, _ in owner.components {
         invalidate_component(component)
     }
     let listeners = owner.subscriptions
     for subscription in listeners {
-        if subscription in subscription_registry {
-            let listener = subscription_registry[subscription]
+        if let listener = subscription_registry[subscription] {
             if !listener.tasks.is_closed() {
                 listener.context.run(|| {
                     let result = listener.changed()
@@ -95,8 +96,7 @@ fn state_changed(cell: Any) {
 
 fn invalidate_component(component: ComponentHandle) {
     var current: ComponentHandle? = component
-    while current != nil && current in component_registry {
-        let data = component_registry[current]
+    while let component_id = current, let data = component_registry[component_id] {
         data.dirty = true
         if data.window in window_registry { window_data(data.window).dirty = true }
         current = data.parent
@@ -345,23 +345,26 @@ pub struct Window() {
     }
     pub fn last_error(self) -> str { return window_data(self).render_error }
     pub fn context(self) -> Context { return window_data(self).context }
-    pub fn is_open(self) -> bool { return self in window_registry && !window_registry[self].closed && !window_registry[self].reload_rejected }
+    pub fn is_open(self) -> bool {
+        let data = window_registry[self]
+        return data is not nil && !data.closed && !data.reload_rejected
+    }
 }
 
 /// Durable Zolo capability: native borrows never cross await or this boundary.
 pub struct Context() {
     pub fn is_active(self) -> bool {
-        return self in context_registry && !context_registry[self].tasks.is_closed() && context_registry[self].window.is_open()
+        let data = context_registry[self]
+        return data is not nil && !data.tasks.is_closed() && data.window.is_open()
     }
     pub fn window(self) -> Window {
-        assert(self in context_registry, "context is closed or was not created by the application")
-        let window = context_registry[self].window
+        let window = context_data(self).window
         window_data(window)
         return window
     }
     pub fn notify(self) {
         let window = self.window()
-        let data = context_registry[self]
+        let data = context_data(self)
         let component = data.component
         if component != nil { invalidate_component(component) }
         else { window.notify() }
@@ -369,7 +372,7 @@ pub struct Context() {
     pub fn focus(self, key: str) { self.window().focus(key) }
     pub fn run<T>(self, body: fn() -> T) -> T {
         let window = self.window()
-        let data = context_registry[self]
+        let data = context_data(self)
         assert(window.is_open() && !data.tasks.is_closed(), "context is closing")
         let previous_window = rendering_window
         let previous_component = rendering_component
@@ -380,15 +383,18 @@ pub struct Context() {
     }
 }
 struct ContextData { window: Window, component: ComponentHandle?, tasks: TaskGroup }
+fn context_data(cx: Context) -> ContextData {
+    return context_registry[cx] ?? panic("context is closed or was not created by the application")
+}
 
 pub struct Subscription() {
     pub fn dispose(self) {
-        if !(self in subscription_registry) { return }
-        let data = subscription_registry[self]
+        guard let data = subscription_registry[self] else { return }
         subscription_registry.remove(self)
+        let owner = state_owner(data.cell)
         let keep: [Subscription] = []
-        for item in state_owners[data.cell].subscriptions { if item in subscription_registry { keep.push(item) } }
-        state_owners[data.cell].subscriptions = keep
+        for item in owner.subscriptions { if item in subscription_registry { keep.push(item) } }
+        owner.subscriptions = keep
     }
     pub fn is_active(self) -> bool { return self in subscription_registry }
 }
@@ -493,10 +499,7 @@ var rejected_reload_windows: [Window] = []
 var rejected_reload_apps: [App] = []
 
 pub fn application(key: str = "main") -> App {
-    if key in application_keys {
-        let old = application_keys[key]
-        if old in app_registry && app_registry[old].running { return old }
-    }
+    if let old = application_keys[key], let owner = app_registry[old], owner.running { return old }
     let app = App.new()
     app_registry[app] = AppData.new(key: key, tasks: task_group())
     application_keys[key] = app
@@ -505,21 +508,22 @@ pub fn application(key: str = "main") -> App {
 
 pub fn context() -> Context {
     let window = rendering_window ?? panic("context() requires a render or event callback")
-    if rendering_component != nil { return component_registry[rendering_component].context }
+    if let component = rendering_component { return component_data(component).context }
     return window_data(window).view_context
 }
 
 fn app_data(app: App) -> AppData {
-    assert(app in app_registry, "application handle is closed or was not created by application()")
-    return app_registry[app]
+    return app_registry[app] ?? panic("application handle is closed or was not created by application()")
 }
 fn window_data(window: Window) -> WindowData {
-    assert(window in window_registry, "window handle is closed or was not created by App.window()")
-    return window_registry[window]
+    return window_registry[window] ?? panic("window handle is closed or was not created by App.window()")
+}
+fn component_data(component: ComponentHandle) -> ComponentData {
+    return component_registry[component] ?? panic("component handle is closed or was not created by Component()")
 }
 fn window_for(app: App, id: int) -> Window? {
     for window in app_data(app).windows {
-        if window in window_registry && window_registry[window].id == id { return window }
+        if let data = window_registry[window], data.id == id { return window }
     }
     return nil
 }
@@ -531,8 +535,7 @@ fn command(window: Window, kind: str, text: str = "", width: float = 0.0, height
 fn open_window(app: App, key: str, view: fn() -> Node, options: WindowOptions) -> Window {
     let owner = app_data(app)
     for window in owner.windows {
-        if window in window_registry && !window_registry[window].reload_rejected && window_registry[window].key == key {
-            let data = window_registry[window]
+        if let data = window_registry[window], !data.reload_rejected && data.key == key {
             assert(!data.closed, "cannot replace a closing window")
             data.pending_view = view
             data.dirty = true
@@ -558,12 +561,12 @@ fn open_window(app: App, key: str, view: fn() -> Node, options: WindowOptions) -
 fn watch_state(cell: Any, changed: fn() -> Any) -> Subscription {
     state_read(cell)
     let cx = context()
-    let data = context_registry[cx]
+    let data = context_data(cx)
     let subscription = Subscription.new()
     subscription_registry[subscription] = SubscriptionData.new(cell: cell, window: data.window, component: data.component, context: cx, tasks: data.tasks, changed: changed)
-    state_owners[cell].subscriptions.push(subscription)
-    if rendering_component != nil { component_registry[rendering_component].subscriptions.push(subscription) }
-    else if rendering_window != nil { window_data(rendering_window).subscriptions.push(subscription) }
+    state_owner(cell).subscriptions.push(subscription)
+    if let component = rendering_component { component_data(component).subscriptions.push(subscription) }
+    else if let window = rendering_window { window_data(window).subscriptions.push(subscription) }
     return subscription
 }
 
@@ -573,8 +576,13 @@ pub fn Component(id: str, view: fn() -> Node) -> Node {
     assert(id != "", "Component requires a stable nonempty id")
     let window = rendering_window ?? panic("Component requires an application render")
     let data = window_data(window)
-    let parent = if rendering_component == nil { "root" } else { component_registry[rendering_component].key }
-    let parent_tasks = if rendering_component == nil { data.view_tasks } else { component_registry[rendering_component].tasks }
+    var parent = "root"
+    var parent_tasks = data.view_tasks
+    if let current = rendering_component {
+        let owner = component_data(current)
+        parent = owner.key
+        parent_tasks = owner.tasks
+    }
     let key = "{parent}/{key_segment(id)}"
     if !(key in data.components) {
         let component_id = ComponentHandle.new()
@@ -584,14 +592,14 @@ pub fn Component(id: str, view: fn() -> Node) -> Node {
         component_registry[component_id] = ComponentData.new(window: window, parent: rendering_component, context: cx, key: key, render: view, cached: Node.new(kind: "fragment"), tasks: tasks)
         context_registry[cx] = ContextData.new(window: window, component: component_id, tasks: tasks)
     }
-    let component_id = data.components[key]
-    let component = component_registry[component_id]
+    let component_id = data.components[key] ?? panic("component '{key}' was not mounted")
+    let component = component_data(component_id)
     component.visited = true
     if component.render != view { component.dirty = true }
     component.render = view
     if component.tasks.is_closed() {
         component.tasks = parent_tasks.run(task_group)
-        context_registry[component.context].tasks = component.tasks
+        context_data(component.context).tasks = component.tasks
         component.dirty = true
     }
     if component.dirty {
@@ -610,8 +618,7 @@ pub fn Component(id: str, view: fn() -> Node) -> Node {
 }
 
 fn dispose_component(component_id: ComponentHandle) {
-    if !(component_id in component_registry) { return }
-    let data = component_registry[component_id]
+    guard let data = component_registry[component_id] else { return }
     data.tasks.close()
     for subscription in data.subscriptions { subscription.dispose() }
     for _, owner in state_owners { owner.components.remove(component_id) }
@@ -624,8 +631,7 @@ fn desktop_encode(node: Node, owner: WindowData, path: str, tasks: TaskGroup, in
     var component_owner: ComponentHandle? = inherited_component
     if "__component" in node.attrs {
         let component_id = node.attrs["__component"]
-        assert(component_id in component_registry, "component ownership is invalid")
-        let component = component_registry[component_id]
+        let component = component_registry[component_id] ?? panic("component ownership is invalid")
         component.visited = true
         assert(window_data(component.window).id == owner.id, "component belongs to another window")
         current_tasks = component.tasks
@@ -676,8 +682,8 @@ fn desktop_render(app: App, id: int) -> [DesktopNode] {
         release_frame(candidate)
         let retired_cells: [Any] = []
         for admission in candidate.state_admissions {
-            if admission.key in states && states[admission.key].cell == admission.cell { states.remove(admission.key) }
-            let owner = state_owners[admission.cell]
+            if let slot = states[admission.key], slot.cell == admission.cell { states.remove(admission.key) }
+            let owner = state_owner(admission.cell)
             owner.windows.clear()
             owner.components.clear()
             for subscription in owner.subscriptions { subscription.dispose() }
@@ -688,7 +694,7 @@ fn desktop_render(app: App, id: int) -> [DesktopNode] {
             app_data(app).retired_frames.push(RetiredFrame.new(tasks: candidate.view_tasks, cells: retired_cells))
         }
         for _, owner in state_owners { owner.windows.remove(window) }
-        for cell in previous_dependencies { state_owners[cell].windows[window] = true }
+        for cell in previous_dependencies { state_owner(cell).windows[window] = true }
         data.pending_view = nil
         data.render_error = tostring(failure)
         if !app_data(app).updates { error(failure, 0) }
@@ -724,7 +730,7 @@ fn render_frame(window: Window, data: WindowData) -> [DesktopNode] {
     for _, owner in state_owners { owner.windows.remove(window) }
     for subscription in data.subscriptions { subscription.dispose() }
     data.subscriptions = []
-    for _, component_id in data.components { if component_id in component_registry { component_registry[component_id].visited = false } }
+    for _, component_id in data.components { if let component = component_registry[component_id] { component.visited = false } }
     data.handlers.clear()
     let node = data.view_tasks.run(data.view)
     let tree = desktop_encode(node, data, "root", data.view_tasks)
@@ -732,7 +738,7 @@ fn render_frame(window: Window, data: WindowData) -> [DesktopNode] {
     assert(invalid == "", invalid)
     let unmounted: [str] = []
     for key, component_id in data.components {
-        if component_id in component_registry && !component_registry[component_id].visited { unmounted.push(key); dispose_component(component_id) }
+        if let component = component_registry[component_id], !component.visited { unmounted.push(key); dispose_component(component_id) }
     }
     for key in unmounted { data.components.remove(key) }
     data.cached_tree = [tree]
@@ -745,9 +751,8 @@ fn desktop_dispatch(app: App, events: [DesktopEvent]) {
         let window = window_for(app, event.window)
         if window == nil { continue }
         let data = window_data(window)
-        if data.closed || data.reload_rejected || !(event.node in data.handlers) { continue }
-        let handler = data.handlers[event.node]
-        if handler.tasks.is_closed() { continue }
+        if data.closed || data.reload_rejected { continue }
+        guard let handler = data.handlers[event.node], !handler.tasks.is_closed() else { continue }
         let previous = rendering_window
         let previous_component = rendering_component
         rendering_window = window
@@ -832,8 +837,7 @@ fn finish_entry_updates(token: Any, succeeded: bool) -> Any {
     let windows = snapshot.windows
     let apps = snapshot.apps
     for window, data in window_registry {
-        if window in windows {
-            let previous = windows[window]
+        if let previous = windows[window] {
             data.pending_view = previous.pending_view
             data.dirty = previous.dirty
         } else {
@@ -843,8 +847,7 @@ fn finish_entry_updates(token: Any, succeeded: bool) -> Any {
         }
     }
     for app, data in app_registry {
-        if app in apps {
-            let previous = apps[app]
+        if let previous = apps[app] {
             data.queued = previous.queued
             data.commands = previous.commands
         } else {
@@ -854,25 +857,24 @@ fn finish_entry_updates(token: Any, succeeded: bool) -> Any {
         }
     }
     application_keys = snapshot.keys
-    for app in rejected_reload_apps { app_registry[app].tasks.close() }
+    for app in rejected_reload_apps { app_data(app).tasks.close() }
     return nil
 }
 
 fn retire_entry_windows() {
     let pending_windows: [Window] = []
     for window in rejected_reload_windows {
-        if window in window_registry {
-            let data = window_registry[window]
+        if let data = window_registry[window] {
             if desktop_close(data.app, data.id) { pending_windows.push(window) }
         }
     }
     rejected_reload_windows = pending_windows
     let pending_apps: [App] = []
     for app in rejected_reload_apps {
-        let data = app_registry[app]
+        let data = app_data(app)
         var windows_pending = false
         for window in pending_windows {
-            if window in window_registry && window_registry[window].app == app { windows_pending = true }
+            if let pending = window_registry[window], pending.app == app { windows_pending = true }
         }
         if data.tasks.poll().pending || windows_pending { pending_apps.push(app) }
         else { app_registry.remove(app) }
@@ -890,9 +892,7 @@ fn desktop_advance(app: App) -> DesktopTurn {
     retire_entry_windows()
     let polls: [DesktopPoll] = []
     for window in owner.windows {
-        if !(window in window_registry) { continue }
-        let data = window_registry[window]
-        if data.closed { continue }
+        guard let data = window_registry[window], !data.closed else { continue }
         let turn = data.tasks.poll()
         polls.push(DesktopPoll.new(window: data.id, changed: data.dirty || turn.resumed > 0, pending: turn.pending, next_ms: turn.next_ms ?? 16.0))
         data.dirty = false
@@ -916,9 +916,9 @@ fn drain_application(app: App, owner: AppData) -> ApplicationDrain {
     while pending {
         pending = false
         for window in owner.windows {
-            if window in window_registry {
+            if let data = window_registry[window] {
                 try {
-                    pending = desktop_close(app, window_registry[window].id) || pending
+                    pending = desktop_close(app, data.id) || pending
                 } catch failure {
                     if !outcome.failed { outcome.failed = true; outcome.failure = failure }
                     pending = true
