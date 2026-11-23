@@ -70,7 +70,8 @@ install_reload_host(|| {
     let failed = advance_once()
     assert(failed.windows.len() == 2 && failed.windows[0].title == "event-window" && failed.windows[1].title == "module-window", "only earlier admitted windows should publish")
     assert(failed.commands.len() == 2 && failed.commands[0].text == "event-title" && failed.commands[1].text == "module-title", "only earlier admitted titles should publish")
-    assert(!rejected.is_open(), "failed replay window must not stay open")
+    let rejected_window = rejected ?? panic("missing rejected replay window")
+    assert(!rejected_window.is_open(), "failed replay window must not stay open")
     assert(event_window.is_open(), "event-created window must survive failed replay")
     assert(render_now(main)[0].children[0].text == "event-before", "failed entry must preserve earlier pending view")
     click_now(main)
@@ -165,9 +166,9 @@ install_reload_host(|| {
         accepted_tools = tools
         let old = rejected_tools ?? panic("missing rejected tools window")
         assert(window_id(tools) != window_id(old), "successful same-batch retry must allocate a new window")
-        assert(!rejected_tools.is_open() && !rejected_tools_context.is_active(), "rejected window authority must detach immediately")
+        assert(!old.is_open() && !rejected_tools_context.is_active(), "rejected window authority must detach immediately")
         var command_denied = false
-        try { rejected_tools.title("late-rejected-title") } catch _ { command_denied = true }
+        try { old.title("late-rejected-title") } catch _ { command_denied = true }
         assert(command_denied, "rejected window must not enqueue commands")
         var run_denied = false
         try { rejected_tools_context.run(|| nil) } catch _ { run_denied = true }
@@ -202,7 +203,8 @@ install_reload_host(|| {
     })
     let retired = advance_once()
     assert(retired.windows.len() == 0 && retired.commands.len() == 0)
-    assert(!retired_window.is_open() && !retired_app_cleaned, "cleanup must still be pending at host return")
+    let retired_unseen = retired_window ?? panic("missing retired app window")
+    assert(!retired_unseen.is_open() && !retired_app_cleaned, "cleanup must still be pending at host return")
     // Its public key is available immediately, even while the old root drains.
     let retry = application("immediate-second")
     retry_app = retry
@@ -212,7 +214,8 @@ install_reload_host(|| {
 app.run()
 assert(cleaned && retired_app_cleaned && late == 0 && !main.is_open())
 assert(parked_window.is_open() && parked_window.context().is_active() && !parked_cleaned, "preexisting app must remain active")
-assert(retry_window.is_open(), "successful new app outside replay must remain active")
+let retried = retry_window ?? panic("missing retry window")
+assert(retried.is_open(), "successful new app outside replay must remain active")
 assert(!independent.is_closed() && independent.poll().pending, "independent group must remain active")
 dispose_test_app(parked)
 dispose_test_app(retry_app)
