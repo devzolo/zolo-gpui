@@ -1,6 +1,8 @@
 //! Local tooling package. All test orchestration, deadlines and assertions live in Zolo.
-use std::{fs, path, process, env}
+// Keep this import above `std::process`: the checker otherwise resolves
+// `Output` to `std::process::Output` (bytes), not the text `std::cmd::Output`.
 use std::cmd::{command, Cmd, ProcHandle, Output}
+use std::{fs, path, process, env}
 use window as native_ui
 
 pub struct Options {
