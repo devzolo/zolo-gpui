@@ -37,8 +37,8 @@ pub fn options() -> Options {
         else if flag == "--backend" || flag == "-Backend" { result.backend = value }
         else if flag == "--executable" || flag == "-Executable" { result.executable = path.resolve(value) }
         else if flag == "--library" || flag == "-Library" { result.library = path.resolve(value) }
-        else if flag == "--startup-timeout-seconds" || flag == "-StartupTimeoutSeconds" { result.startup_timeout = (tonumber(value) as? int) ?? panic("Timeout must be an integer") }
-        else if flag == "--step-timeout-seconds" || flag == "-StepTimeoutSeconds" { result.step_timeout = (tonumber(value) as? int) ?? panic("Timeout must be an integer") }
+        else if flag == "--startup-timeout-seconds" || flag == "-StartupTimeoutSeconds" { result.startup_timeout = seconds(value) }
+        else if flag == "--step-timeout-seconds" || flag == "-StepTimeoutSeconds" { result.step_timeout = seconds(value) }
         else { panic("Unknown option: {flag}") }
         i += 2
     }
@@ -47,16 +47,17 @@ pub fn options() -> Options {
     assert(fs.is_file(path.join(result.library, "examples", "zolo.toml")), "Library examples consumer is missing: {result.library}")
     return result
 }
+fn seconds(value: str) -> int = value.parse<int>() recover { _ => panic("Timeout must be an integer: {value}") }
 pub fn process_job(child: ProcHandle) -> int {
     if env.os() != "windows" { return 0 }
     return native_ui::process_job(child.pid())
 }
 pub fn release_job(token: int) { if token > 0 { native_ui::release_job(token) } }
 pub fn now_ms() -> float { return process.uptime() * 1000.0 }
-pub fn mkdir(directory: str) { assert(fs.mkdir(directory) != nil, "Could not create {directory}") }
-pub fn write(filename: str, source: str) { assert(fs.write(filename, source) != nil, "Could not write {filename}") }
-pub fn read(filename: str) -> str { let source = fs.read(filename); assert(source != nil, "Could not read {filename}"); return (source as? str) ?? panic("Expected UTF8 text") }
-pub fn copy(source: str, destination: str) { assert(fs.copy(source, destination) != nil, "Could not copy {source} to {destination}") }
+pub fn mkdir(directory: str) { fs.mkdir(directory) recover { message => panic("Could not create {directory}: {message}") } }
+pub fn write(filename: str, source: str) { fs.write(filename, source) recover { message => panic("Could not write {filename}: {message}") } }
+pub fn read(filename: str) -> str = fs.read(filename) recover { message => panic("Could not read {filename}: {message}") }
+pub fn copy(source: str, destination: str) { fs.copy(source, destination) recover { message => panic("Could not copy {source} to {destination}: {message}") } }
 pub fn run_directory(root: str, group: str, backend: str) -> str {
     let identifier = "{process.pid()}-{process.uptime()}".replace(".", "-")
     let directory = path.join(root, "target", group, backend, identifier)
@@ -224,7 +225,7 @@ impl Gate {
 }
 pub fn desktop(options: Options, example: str, group: str, prefix: str) -> Gate {
     assert(env.os() == "windows", "This gate requires an interactive Windows desktop")
-    let directory = run_directory(options.library, "{group.lower()}-verification", options.backend)
+    let directory = run_directory(options.library, "{group.to_lower()}-verification", options.backend)
     let examples = path.join(options.library, "examples")
     let fixture = path.join(examples, "{example}.zolo")
     let deployment = path.join(directory, "deployment")
